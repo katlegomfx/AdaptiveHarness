@@ -11,9 +11,11 @@ from runtime.result import ResultStatus
 
 TOOL_REGISTRY: Dict[str, Callable] = {}
 REGISTRY_LOCK = threading.RLock()
-# 3.8 Parallel Execution Race on custom_tools/
 CUSTOM_TOOLS_WRITE_LOCK = threading.RLock()
 CUSTOM_TOOLS_DIR = os.path.join(os.path.dirname(__file__), "custom_tools")
+
+# Explicit set of meta-tools that must always be available to the agent
+META_TOOLS = {"create_tool", "update_tool", "edit_source_file"}
 
 BANNED_IMPORTS = {"ctypes", "pickle", "socket", "builtins"}
 BANNED_FUNCTIONS = {"eval", "exec", "compile", "__import__"}
@@ -94,18 +96,17 @@ def validate_python_code(python_code: str) -> Tuple[bool, str]:
             return False, "Validation Error: Module-level executable code is prohibited. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
         if isinstance(node, ast.Assign):
             if isinstance(node.value, ast.Call):
-                return False, "Validation Error: Module-level function calls are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+                return False, "Validation Error: Module-level function calls are prohibited."
             continue
         if isinstance(node, ast.AnnAssign):
             if isinstance(node.value, ast.Call):
-                return False, "Validation Error: Module-level function calls are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+                return False, "Validation Error: Module-level function calls are prohibited."
             continue
         if isinstance(node, ast.Expr):
-            return False, "Validation Error: Module-level executable expressions (like print()) are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+            return False, "Validation Error: Module-level executable expressions (like print()) are prohibited."
 
-        return False, "Validation Error: Module-level executable code is prohibited. Only use imports, class/function definitions, or `if __name__ == '__main__':`."
+        return False, "Validation Error: Module-level executable code is prohibited."
 
-    # 5.6 validate_python_code Regex for Boolean Returns is Fragile
     for node in ast.walk(tree):
         if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
             if isinstance(node.value.value, bool):
@@ -188,26 +189,38 @@ def get_relevant_tools(user_query: str, top_k: int = 5) -> list[Callable]:
         tools = list(TOOL_REGISTRY.values())
         if len(tools) <= top_k:
             return tools
+
         query_tokens = set(re.findall(r"\w+", user_query.lower()))
         scored_tools = []
+        meta_tools_found = []
+
         for func in tools:
             name = func.__name__
+            if name in META_TOOLS:
+                meta_tools_found.append(func)
+                continue
+
             doc = inspect.getdoc(func) or ""
             text = f"{name} {doc}".lower()
             text_tokens = set(re.findall(r"\w+", text))
-            if name in ("create_tool", "update_tool"):
-                score = 999.0
-            else:
-                overlap = len(query_tokens.intersection(text_tokens))
-                score = overlap / \
-                    math.sqrt(len(text_tokens) + 1) if text_tokens else 0.0
+            overlap = len(query_tokens.intersection(text_tokens))
+            score = overlap / \
+                math.sqrt(len(text_tokens) + 1) if text_tokens else 0.0
             scored_tools.append((score, func))
+
         scored_tools.sort(key=lambda x: x[0], reverse=True)
-        return [func for _, func in scored_tools[:top_k]]
+
+        # Guarantee meta-tools are always included in the top_k context window
+        dynamic_to_take = top_k - len(meta_tools_found)
+        if dynamic_to_take < 0:
+            dynamic_to_take = 0
+
+        result = meta_tools_found + [func for _,
+                                     func in scored_tools[:dynamic_to_take]]
+        return result[:top_k]
 
 
 def _extract_sample_args(test_inputs):
-    """Helper to extract arguments from various test input formats."""
     sample_args_list = test_inputs if isinstance(
         test_inputs, list) else [test_inputs]
     extracted_args = []
@@ -264,8 +277,6 @@ def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
 
     try:
         ensure_package_init()
-
-        # 3.8 Parallel Execution Race on custom_tools/
         with CUSTOM_TOOLS_WRITE_LOCK:
             file_path = os.path.join(
                 CUSTOM_TOOLS_DIR, f"{actual_func_name}.py")
@@ -274,7 +285,6 @@ def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
                 f.write(python_code)
             importlib.invalidate_caches()
 
-        # 5.5 Adversarial Tester Generates Only One Test Case
         extracted_args = _extract_sample_args(test_inputs)
         for sample_args in extracted_args:
             test_result = execute_tool_in_sandbox(

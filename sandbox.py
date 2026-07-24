@@ -1,4 +1,3 @@
-# 3.4 Structured Error Types Instead of String Matching
 import json
 import os
 import subprocess
@@ -48,16 +47,23 @@ def trace_exceptions(exc_type, exc_value, tb):
 sys.excepthook = trace_exceptions
 
 try:
-    from custom_tools.{tool_name} import {tool_name}
+    # Wrap import to prevent stdout pollution breaking JSON IPC
+    import_buffer = io.StringIO()
+    with redirect_stdout(import_buffer):
+        from custom_tools.{tool_name} import {tool_name}
 
     raw_input = sys.stdin.read()
     args = json.loads(raw_input) if raw_input.strip() else {{}}
 
-    log_buffer = io.StringIO()
-    with redirect_stdout(log_buffer):
+    exec_buffer = io.StringIO()
+    with redirect_stdout(exec_buffer):
         result = {tool_name}(**args)
 
-    tool_logs = log_buffer.getvalue().strip()
+    # Combine import logs and execution logs
+    tool_logs = import_buffer.getvalue().strip()
+    if tool_logs:
+        tool_logs += "\\n"
+    tool_logs += exec_buffer.getvalue().strip()
 
     if isinstance(result, bool):
         result = "Success" if result else "Completed but returned False"

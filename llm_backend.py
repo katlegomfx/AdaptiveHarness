@@ -1,10 +1,10 @@
 """
 llm_backend.py — Single-toggle LLM backend (Ollama or llama.cpp).
 """
-
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -19,25 +19,23 @@ try:
 except ImportError:
     pass
 
-OLLAMA_INFRA: bool = os.environ.get("OLLAMA_INFRA", "True").strip().lower() in (
-    "true", "1", "yes", "on",
-)
-
+OLLAMA_INFRA: bool = os.environ.get(
+    "OLLAMA_INFRA", "True").strip().lower() in ("true", "1", "yes", "on",)
 OLLAMA_BASE_URL: str = os.environ.get(
     "OLLAMA_BASE_URL", "http://localhost:11434")
-MODELS_DIR: str = os.environ.get(
-    "LLAMACPP_MODELS_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
-)
+MODELS_DIR: str = os.environ.get("LLAMACPP_MODELS_DIR", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models"),)
 LLAMACPP_N_CTX: int = int(os.environ.get("LLAMACPP_N_CTX", "8192"))
 LLAMACPP_N_GPU_LAYERS: int = int(os.environ.get("LLAMACPP_N_GPU_LAYERS", "-1"))
 LLAMACPP_N_THREADS: int = int(os.environ.get("LLAMACPP_N_THREADS", "0"))
 
-# 3.1 Fix Duplicate MODEL_MAP Key
 MODEL_MAP: Dict[str, Dict[str, str]] = {
     "ornith": {"gguf": "ornith.gguf", "ollama": "ornith"},
 }
 assert len(MODEL_MAP) == len(set(MODEL_MAP)), "Duplicate keys in MODEL_MAP"
+
+# Thread safety lock for local llama.cpp execution
+_llamacpp_lock = threading.Lock()
 
 
 @dataclass
@@ -51,9 +49,7 @@ class Message:
 def _check_ollama() -> bool:
     try:
         req = urllib.request.Request(
-            f"{OLLAMA_BASE_URL}/api/tags",
-            headers={"Accept": "application/json"},
-        )
+            f"{OLLAMA_BASE_URL}/api/tags", headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status == 200
     except Exception:
@@ -67,9 +63,8 @@ def _scan_gguf() -> Dict[str, str]:
     disk_files: Dict[str, str] = {}
     for fname in os.listdir(MODELS_DIR):
         if fname.lower().endswith(".gguf"):
-            disk_files[fname[:-5].lower()] = os.path.abspath(
-                os.path.join(MODELS_DIR, fname)
-            )
+            disk_files[fname[:-5].lower()
+                       ] = os.path.abspath(os.path.join(MODELS_DIR, fname))
     for logical, mapping in MODEL_MAP.items():
         stem = mapping["gguf"].lower().replace(".gguf", "")
         if stem in disk_files:
@@ -125,11 +120,8 @@ def _get_llama(model_name: str):
     print(f"[LLM Backend] Loading '{model_name}'...", end=" ", flush=True)
     t0 = time.time()
     kwargs: Dict[str, Any] = {
-        "model_path": path,
-        "n_ctx": LLAMACPP_N_CTX,
-        "n_gpu_layers": LLAMACPP_N_GPU_LAYERS,
-        "verbose": False,
-        "chat_format": "chatml",
+        "model_path": path, "n_ctx": LLAMACPP_N_CTX, "n_gpu_layers": LLAMACPP_N_GPU_LAYERS,
+        "verbose": False, "chat_format": "chatml",
     }
     if LLAMACPP_N_THREADS > 0:
         kwargs["n_threads"] = LLAMACPP_N_THREADS
@@ -138,8 +130,6 @@ def _get_llama(model_name: str):
     print(f"done ({time.time() - t0:.1f}s)")
     _llamacpp_instances[model_name] = instance
     return instance
-
-# 5.4 Stop Using inspect.signature for Tool Schemas
 
 
 def _tools_to_openai(tools: Optional[List[Any]]) -> Optional[List[Dict]]:
@@ -178,24 +168,16 @@ def _tools_to_openai(tools: Optional[List[Any]]) -> Optional[List[Dict]]:
         out.append({
             "type": "function",
             "function": {
-                "name": t.__name__,
-                "description": doc.split("\n")[0] if doc else "",
-                "parameters": {
-                    "type": "object",
-                    "properties": props,
-                    "required": required,
-                },
+                "name": t.__name__, "description": doc.split("\n")[0] if doc else "",
+                "parameters": {"type": "object", "properties": props, "required": required},
             },
         })
     return out or None
 
 
 def chat(
-    model: str,
-    messages: List[Dict[str, Any]],
-    tools: Optional[List[Any]] = None,
-    think: bool = False,
-    stream: bool = True,
+    model: str, messages: List[Dict[str, Any]], tools: Optional[List[Any]] = None,
+    think: bool = False, stream: bool = True
 ) -> Generator[Dict[str, Any], None, None]:
     if OLLAMA_INFRA:
         yield from _chat_ollama(model, messages, tools, think, stream)
@@ -206,9 +188,8 @@ def chat(
 def _chat_ollama(model, messages, tools, think, stream):
     from ollama import chat as ollama_chat
     resolved = MODEL_MAP.get(model, {}).get("ollama", model)
-    for chunk in ollama_chat(
-        model=resolved, messages=messages, tools=tools, think=think, stream=stream,
-    ):
+    # Ollama server handles concurrent requests natively
+    for chunk in ollama_chat(model=resolved, messages=messages, tools=tools, think=think, stream=stream):
         yield chunk
 
 
@@ -217,45 +198,34 @@ def _chat_llamacpp(model, messages, tools, think, stream):
     openai_tools = _tools_to_openai(tools)
 
     kwargs: Dict[str, Any] = {
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.6,
-        "top_p": 0.9,
+        "messages": messages, "stream": True, "temperature": 0.6, "top_p": 0.9,
     }
     if openai_tools:
         kwargs["tools"] = openai_tools
         kwargs["tool_choice"] = "auto"
 
-    raw = instance.create_chat_completion(**kwargs)
-    tc_buf: Dict[int, Dict[str, Any]] = {}
+    # Serialize llama.cpp calls to prevent thread crashes (segfaults)
+    with _llamacpp_lock:
+        raw = instance.create_chat_completion(**kwargs)
+        tc_buf: Dict[int, Dict[str, Any]] = {}
 
-    for chunk in raw:
-        delta = chunk.get("choices", [{}])[0].get("delta", {})
-        content = delta.get("content") or None
+        for chunk in raw:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content") or None
 
-        for frag in (delta.get("tool_calls") or []):
-            idx = frag.get("index", 0)
-            if idx not in tc_buf:
-                tc_buf[idx] = {
-                    "id": frag.get("id", f"call_{idx}"),
-                    "type": "function",
-                    "function": {"name": "", "arguments": ""},
-                }
-            fn = frag.get("function", {})
-            if fn.get("name"):
-                tc_buf[idx]["function"]["name"] += fn["name"]
-            if fn.get("arguments"):
-                tc_buf[idx]["function"]["arguments"] += fn["arguments"]
+            for frag in (delta.get("tool_calls") or []):
+                idx = frag.get("index", 0)
+                if idx not in tc_buf:
+                    tc_buf[idx] = {"id": frag.get("id", f"call_{idx}"), "type": "function", "function": {
+                        "name": "", "arguments": ""}}
+                fn = frag.get("function", {})
+                if fn.get("name"):
+                    tc_buf[idx]["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    tc_buf[idx]["function"]["arguments"] += fn["arguments"]
 
-        if content:
-            yield {
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "thinking": None,
-                    "tool_calls": None,
-                }
-            }
+            if content:
+                yield {"message": {"role": "assistant", "content": content, "thinking": None, "tool_calls": None}}
 
     if tc_buf:
         final = []
@@ -266,11 +236,8 @@ def _chat_llamacpp(model, messages, tools, think, stream):
                 parsed = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
                 parsed = {"_raw": raw_args}
-            final.append({
-                "id": entry["id"],
-                "type": "function",
-                "function": {"name": entry["function"]["name"], "arguments": parsed},
-            })
+            final.append({"id": entry["id"], "type": "function", "function": {
+                         "name": entry["function"]["name"], "arguments": parsed}})
         yield {"message": {"role": "assistant", "content": None, "thinking": None, "tool_calls": final}}
 
 
@@ -282,10 +249,8 @@ def chat_sync(model: str, messages: List[Dict], tools=None, think=False) -> Mess
                            tools=tools, think=think, stream=False)
         m = resp.get("message", resp) if isinstance(resp, dict) else resp
         return Message(
-            role=getattr(m, "role", "assistant"),
-            content=getattr(m, "content", None),
-            tool_calls=getattr(m, "tool_calls", None),
-            thinking=getattr(m, "thinking", None),
+            role=getattr(m, "role", "assistant"), content=getattr(m, "content", None),
+            tool_calls=getattr(m, "tool_calls", None), thinking=getattr(m, "thinking", None),
         )
     else:
         parts_c, parts_t, final_tc = [], [], None
@@ -298,8 +263,6 @@ def chat_sync(model: str, messages: List[Dict], tools=None, think=False) -> Mess
             if m.get("tool_calls") is not None:
                 final_tc = m["tool_calls"]
         return Message(
-            role="assistant",
-            content="".join(parts_c) or None,
-            tool_calls=final_tc,
-            thinking="".join(parts_t) or None,
+            role="assistant", content="".join(parts_c) or None,
+            tool_calls=final_tc, thinking="".join(parts_t) or None,
         )
