@@ -178,6 +178,37 @@ def get_relevant_tools(user_query: str, top_k: int = 5) -> list[Callable]:
         return [func for _, func in scored_tools[:top_k]]
 
 
+def _extract_sample_args(test_inputs):
+    """Helper to extract arguments from various test input formats."""
+    sample_args_list = test_inputs if isinstance(
+        test_inputs, list) else [test_inputs]
+    extracted_args = []
+
+    for sample_args in sample_args_list:
+        if isinstance(sample_args, dict):
+            if "args" in sample_args and isinstance(sample_args["args"], dict):
+                extracted_args.append(sample_args["args"])
+            else:
+                found = False
+                for meta_key in ["test_cases", "test1", "sample_args", "edge_cases", "edge_case"]:
+                    if meta_key in sample_args:
+                        val = sample_args[meta_key]
+                        if isinstance(val, dict):
+                            extracted_args.append(val)
+                            found = True
+                            break
+                        elif isinstance(val, list) and val and isinstance(val[0], dict):
+                            extracted_args.append(val[0])
+                            found = True
+                            break
+                if not found:
+                    extracted_args.append(sample_args)
+        else:
+            extracted_args.append({})
+
+    return extracted_args
+
+
 @register_tool
 def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> str:
     """Creates, registers, and persists a brand-new Python tool after 3-stage validation."""
@@ -216,22 +247,8 @@ def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
             importlib.invalidate_caches()
 
         # 5.5 Adversarial Tester Generates Only One Test Case
-        sample_args_list = test_inputs if isinstance(
-            test_inputs, list) else [test_inputs]
-        for sample_args in sample_args_list:
-            if isinstance(sample_args, dict):
-                for meta_key in ["test_cases", "test1", "sample_args", "edge_cases", "edge_case"]:
-                    if meta_key in sample_args:
-                        val = sample_args[meta_key]
-                        if isinstance(val, dict):
-                            sample_args = val
-                            break
-                        elif isinstance(val, list) and val and isinstance(val[0], dict):
-                            sample_args = val[0]
-                            break
-            else:
-                sample_args = {}
-
+        extracted_args = _extract_sample_args(test_inputs)
+        for sample_args in extracted_args:
             test_result = execute_tool_in_sandbox(
                 actual_func_name, sample_args, timeout_seconds=15)
             if not test_result.is_success:
@@ -291,22 +308,8 @@ def update_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
                 f.write(python_code)
             importlib.invalidate_caches()
 
-        sample_args_list = test_inputs if isinstance(
-            test_inputs, list) else [test_inputs]
-        for sample_args in sample_args_list:
-            if isinstance(sample_args, dict):
-                for meta_key in ["test_cases", "test1", "sample_args", "edge_cases", "edge_case"]:
-                    if meta_key in sample_args:
-                        val = sample_args[meta_key]
-                        if isinstance(val, dict):
-                            sample_args = val
-                            break
-                        elif isinstance(val, list) and val and isinstance(val[0], dict):
-                            sample_args = val[0]
-                            break
-            else:
-                sample_args = {}
-
+        extracted_args = _extract_sample_args(test_inputs)
+        for sample_args in extracted_args:
             test_result = execute_tool_in_sandbox(
                 actual_func_name, sample_args, timeout_seconds=15)
             if not test_result.is_success:

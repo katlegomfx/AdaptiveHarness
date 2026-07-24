@@ -31,6 +31,11 @@ MAX_HEAL_RETRIES = 2
 MAX_AGENT_ITERATIONS = 25
 YOLO_MODE = False
 
+# Meta-tools live in dynamic_tools.py, NOT in custom_tools/.
+# They MUST be executed in-process; the sandbox runner tries to
+# `from custom_tools.<name> import <name>`, which would fail for them.
+META_TOOLS = ("create_tool", "update_tool", "edit_source_file")
+
 BASE_SYSTEM_PROMPT = (
     "You are an AI assistant equipped with dynamic tool creation, self-healing, and self-improvement capabilities.\n"
     "1. If the user asks for information or an action for which NO tool exists, you MUST call `create_tool`.\n"
@@ -44,6 +49,8 @@ BASE_SYSTEM_PROMPT = (
     "9. EXISTING TOOLS: Before creating a tool, check if a tool with similar capabilities already exists.\n"
     "10. SELF-HEALING: If a tool execution fails with a traceback, the system will attempt to automatically patch the tool code.\n"
     "11. SELF-IMPROVEMENT: You can edit your own core source files using `edit_source_file`.\n"
+    "12. TOOL OUTPUT QUALITY: Tools MUST return the actual data the user requested (e.g., file contents, search results, calculations), NOT just metadata (like success booleans or content lengths). If a tool returns metadata instead of content, it is broken.\n"
+    "13. TOOL CORRECTION: If a tool runs successfully but returns the wrong data format (e.g., returning a dictionary when a string is expected), you MUST use `update_tool` to fix the return statement immediately.\n"
 )
 
 # 5.3 File Logging Inefficiency
@@ -100,14 +107,33 @@ def sanitize_tool_calls(tool_calls: list) -> list:
 def generate_plan(user_prompt: str) -> str:
     """6.2 Planning Step"""
     log_and_stream("-> [Pass 0] Synthesizing execution plan...\n")
+
+    # Fetch current tools to provide context to the planner
+    with REGISTRY_LOCK:
+        active_tools = list(TOOL_REGISTRY.values())
+    tools_info = "\n".join(
+        [f"- {t.__name__}: {inspect.getdoc(t) or 'No description'}" for t in active_tools])
+
     plan_messages = [
-        {"role": "system", "content": "You are an expert planner. Create a concise step-by-step plan for the user's request. Identify what tools need to be created or used."},
+        {"role": "system", "content": f"You are an expert planner. Create a concise step-by-step plan for the user's request. Identify what tools need to be created or used.\n\nCurrently available tools:\n{tools_info}"},
         {"role": "user", "content": user_prompt}
     ]
     try:
-        resp = chat_sync(model=META_PROMPT_MODEL, messages=plan_messages)
-        plan = resp.content or ""
-        log_and_stream(f"[Plan]\n{plan}\n\n")
+        stream = chat(model=META_PROMPT_MODEL,
+                      messages=plan_messages, stream=True)
+        log_and_stream("[Plan]\n")
+        plan = ""
+        for chunk in stream:
+            msg = chunk.get("message") if isinstance(
+                chunk, dict) else getattr(chunk, "message", None)
+            if not msg:
+                continue
+            chunk_content = getattr(msg, "content", None) or (
+                msg.get("content") if isinstance(msg, dict) else None)
+            if chunk_content:
+                log_and_stream(chunk_content)
+                plan += chunk_content
+        log_and_stream("\n\n")
         return plan
     except Exception as e:
         log_and_stream(f"   [Planning Failed]: {e}\n")
@@ -163,7 +189,9 @@ def generate_adversarial_test_cases(tool_name: str, python_code: str) -> list[di
                 "You are an Adversarial QA Testing Agent. Inspect the provided Python function signature. "
                 "Return ONLY a raw JSON array of test case objects. Each object must have a 'name' and 'args' key. "
                 "The 'args' keys MUST EXACTLY match the parameter names of the function. "
-                "Generate 3 distinct test cases: happy path, empty input, and special characters/edge case."
+                "Generate 3 distinct test cases: happy path, empty input, and special characters/edge case. "
+                "Use REAL, plausible values for file paths or inputs (e.g., 'README.md', '', '/tmp/nonexistent.txt'). "
+                "Do NOT invent paths under /test/ that don't exist."
             ),
         },
         {"role": "user", "content": f"Target Function Code:\n{python_code}"},
@@ -278,8 +306,6 @@ def _get_call_details(call) -> tuple[str, dict]:
         return call["function"]["name"], call["function"]["arguments"]
     return getattr(call, "name", ""), getattr(call, "arguments", {})
 
-# 3.3 Replace Recursive Self-Heal with Iterative
-
 
 def _execute_once(call, trace_id: str) -> ToolResult:
     raw_func_name, args = _get_call_details(call)
@@ -288,14 +314,15 @@ def _execute_once(call, trace_id: str) -> ToolResult:
     if not tool_func:
         return ToolResult(ResultStatus.NOT_FOUND, f"Error: Tool '{raw_func_name}' is not registered.")
 
-    # 6.1 Human-in-the-Loop Approval
-    if resolved_name in ("create_tool", "edit_source_file") and not YOLO_MODE:
+    # 6.1 Human-in-the-Loop Approval — applies to ALL meta-tools
+    if resolved_name in META_TOOLS and not YOLO_MODE:
         user_approval = input(
             f"\n> Agent wants to execute '{resolved_name}' with args: {args}. Approve? [y/N] ")
         if user_approval.lower() != 'y':
             return ToolResult(ResultStatus.VALIDATION_FAILURE, "Error: User denied execution.")
 
-    if resolved_name not in ("create_tool", "update_tool"):
+    # Parameter validation only for non-meta (i.e., sandboxed) tools
+    if resolved_name not in META_TOOLS:
         try:
             sig = inspect.signature(tool_func)
             required_params = [
@@ -314,20 +341,35 @@ def _execute_once(call, trace_id: str) -> ToolResult:
     start_time = time.time()
     status = ResultStatus.SUCCESS
     try:
-        if resolved_name == "create_tool":
+        if resolved_name in META_TOOLS:
+            # ---- Meta-tools MUST run in-process ----
+            # They are defined in dynamic_tools.py, NOT in custom_tools/.
+            # The sandbox runner would try `from custom_tools.<name> import <name>`
+            # and crash with ModuleNotFoundError. They also need direct access to
+            # the registry, safety_net, and importlib — none of which are
+            # available inside the isolated sandbox subprocess.
             log_and_stream(
                 f"-> Executing meta-tool in process: '{resolved_name}' [Trace: {trace_id}]...\n")
-            target_tool = args.get("tool_name", "dynamic_func")
-            code = args.get("python_code", "")
-            test_cases = generate_adversarial_test_cases(target_tool, code)
-            args["test_inputs"] = test_cases
+
+            # create_tool / update_tool take python_code and need adversarial
+            # test cases generated for the *target* tool, not for themselves.
+            if resolved_name in ("create_tool", "update_tool"):
+                target_tool = args.get("tool_name", "dynamic_func")
+                code = args.get("python_code", "")
+                test_cases = generate_adversarial_test_cases(target_tool, code)
+                args["test_inputs"] = test_cases
+
             result_str = tool_func(**args)
+
+            # Meta-tools return human-readable strings. "Successfully" indicates
+            # the operation completed; anything else is a validation/rejection.
             if "Successfully" in result_str:
                 status = ResultStatus.SUCCESS
             else:
                 status = ResultStatus.VALIDATION_FAILURE
             return ToolResult(status, result_str)
         else:
+            # ---- Regular dynamic tools run in the sandbox ----
             log_and_stream(
                 f"-> [Sandbox Execution] Tool: '{resolved_name}' [Trace: {trace_id}]...\n")
             return execute_tool_in_sandbox(resolved_name, args, timeout_seconds=120, ephemeral=False)
@@ -351,17 +393,15 @@ def execute_single_tool_call(call, max_heals=2) -> tuple[str, ToolResult]:
         resolved_name, _ = resolve_tool_function(
             _get_call_details(current_call)[0])
 
-        is_dynamic_tool = resolved_name not in (
-            "create_tool", "update_tool", "edit_source_file")
+        is_dynamic_tool = resolved_name not in META_TOOLS
 
-        # Bypass healing if it's a meta-tool, it succeeded, it wasn't found, or we hit the retry limit
         if not is_dynamic_tool or result.is_success or result.status == ResultStatus.NOT_FOUND or heal_attempts >= max_heals:
             return resolved_name, result
 
         heal_attempts += 1
         log_and_stream(
             f"\n!!! [Self-Heal Triggered] Tool '{resolved_name}' crashed. Attempting automated patch ({heal_attempts}/{max_heals})...\n")
-        metrics.record_heal(False)  # Will update to true if successful
+        metrics.record_heal(False)
 
         try:
             tool_path = os.path.join(
@@ -377,8 +417,23 @@ def execute_single_tool_call(call, max_heals=2) -> tuple[str, ToolResult]:
         ]
 
         try:
-            resp = chat_sync(model=META_PROMPT_MODEL, messages=heal_messages)
-            fixed_code = resp.content.replace(
+            log_and_stream("   [Self-Heal] Generating fixed code:\n")
+            stream = chat(model=META_PROMPT_MODEL,
+                          messages=heal_messages, stream=True)
+            fixed_code = ""
+            for chunk in stream:
+                msg = chunk.get("message") if isinstance(
+                    chunk, dict) else getattr(chunk, "message", None)
+                if not msg:
+                    continue
+                chunk_content = getattr(msg, "content", None) or (
+                    msg.get("content") if isinstance(msg, dict) else None)
+                if chunk_content:
+                    log_and_stream(chunk_content)
+                    fixed_code += chunk_content
+            log_and_stream("\n")
+
+            fixed_code = fixed_code.replace(
                 "```python", "").replace("```", "").strip()
         except Exception as e:
             log_and_stream(
@@ -404,7 +459,6 @@ def execute_single_tool_call(call, max_heals=2) -> tuple[str, ToolResult]:
             log_and_stream(
                 "   [Self-Heal Success] Patch applied. Retrying original execution...\n")
             metrics.record_heal(True)
-            # Loop continues and executes current_call again
         else:
             log_and_stream(
                 "   [Self-Heal Failed] Patch was rejected by sandbox validator.\n")
@@ -422,8 +476,29 @@ def reflect_on_task(user_prompt: str, messages: list):
             "content": f"Original Prompt: {user_prompt}\n\nConversation:\n{json.dumps(messages[-10:], default=str)}"}
     ]
     try:
-        resp = chat_sync(model=META_PROMPT_MODEL, messages=reflect_messages)
-        cleaned = resp.content.replace(
+        log_and_stream("[Reflection]\n")
+        stream = chat(model=META_PROMPT_MODEL,
+                      messages=reflect_messages, stream=True)
+        content_buffer = ""
+        for chunk in stream:
+            msg = chunk.get("message") if isinstance(
+                chunk, dict) else getattr(chunk, "message", None)
+            if not msg:
+                continue
+            chunk_content = getattr(msg, "content", None) or (
+                msg.get("content") if isinstance(msg, dict) else None)
+            if chunk_content:
+                log_and_stream(chunk_content)
+                content_buffer += chunk_content
+
+        log_and_stream("\n")
+
+        if not content_buffer.strip():
+            log_and_stream(
+                "   [Reflection Skipped]: Model returned an empty response.\n")
+            return
+
+        cleaned = content_buffer.strip().replace(
             "```json", "").replace("```", "").strip()
         data = json.loads(cleaned)
 
@@ -434,6 +509,12 @@ def reflect_on_task(user_prompt: str, messages: list):
         if improvements:
             with open("improvement_guide.md", "a", encoding="utf-8") as f:
                 f.write(f"\n## Task: {user_prompt}\n{improvements}\n")
+
+        log_and_stream("   [Reflection Complete]: Learnings saved.\n")
+
+    except json.JSONDecodeError:
+        log_and_stream(
+            "   [Reflection Failed]: Model did not return valid JSON.\n")
     except Exception as e:
         log_and_stream(f"   [Reflection Failed]: {e}\n")
 
@@ -464,8 +545,9 @@ def run_agent_loop(
 
     messages.append({"role": "user", "content": user_prompt})
 
-    # 3.2 Add Max Iteration Guard to Agent Loop
     iteration = 0
+    tool_call_history = []  # Track tool calls for loop detection
+
     while iteration < MAX_AGENT_ITERATIONS:
         iteration += 1
 
@@ -479,7 +561,6 @@ def run_agent_loop(
             "content": assistant_message.content or "",
         }
         if assistant_message.tool_calls:
-            # 3.6 Fix sanitize_tool_calls Called Twice
             msg_dict["tool_calls"] = assistant_message.tool_calls
         if hasattr(assistant_message, "thinking") and assistant_message.thinking:
             msg_dict["thinking"] = assistant_message.thinking
@@ -494,12 +575,32 @@ def run_agent_loop(
         tool_calls = assistant_message.tool_calls
         results = []
 
+        # Loop Detection Logic
+        current_tool_names = [tc.get("function", {}).get("name")
+                              for tc in tool_calls]
+        tool_call_history.extend(current_tool_names)
+        loop_detected = False
+        if len(tool_call_history) > 3:
+            recent_calls = tool_call_history[-3:]
+            if len(set(recent_calls)) == 1 and recent_calls[0] not in META_TOOLS:
+                loop_detected = True
+                log_and_stream(
+                    f"\n[Safety] Loop detected: Agent called '{recent_calls[0]}' 3 times in a row. Forcing reflection.\n")
+                for tc in tool_calls:
+                    messages.append({
+                        "role": "tool",
+                        "name": tc.get("function", {}).get("name", ""),
+                        "content": "CRITICAL ERROR: You are stuck in a loop calling this tool. The tool may be returning the wrong data (e.g., metadata instead of actual content). Do NOT call this tool again. Instead, use `update_tool` to fix the tool's logic so it returns the actual content/data the user requested, NOT just metadata or success booleans."
+                    })
+                turn_count += 1
+                save_checkpoint(session_id, turn_count, messages)
+                continue
+
         if len(tool_calls) == 1:
             results.append(execute_single_tool_call(tool_calls[0]))
         else:
             has_meta_tools = any(
-                (tc.get("function", {}).get("name")
-                 in ("create_tool", "update_tool"))
+                (tc.get("function", {}).get("name") in META_TOOLS)
                 for tc in tool_calls
             )
             if has_meta_tools:
@@ -599,7 +700,8 @@ def main():
             learnings = retrieve_learnings(user_input)
 
             history, turn_count = run_agent_loop(
-                user_input, session_id, history, turn_count, plan, learnings)
+                user_input, session_id, history, turn_count, plan, learnings
+            )
 
             # 6.3 Reflection / Post-Mortem
             reflect_on_task(user_input, history)
