@@ -92,8 +92,12 @@ def sanitize_tool_calls(tool_calls: list) -> list:
             sanitized.append(call.dict())
         else:
             func = getattr(call, "function", None)
-            sanitized.append({"function": {"name": getattr(
-                func, "name", ""), "arguments": getattr(func, "arguments", {})}})
+            sanitized.append({
+                "function": {
+                    "name": getattr(func, "name", ""),
+                    "arguments": getattr(func, "arguments", {}),
+                }
+            })
     return sanitized
 
 
@@ -154,6 +158,7 @@ def generate_dynamic_system_prompt(goal: str) -> str:
         },
         {"role": "user", "content": f"Target Goal:\n{goal}"},
     ]
+
     dynamic_rules = ""
     try:
         stream = chat(model=META_PROMPT_MODEL,
@@ -290,7 +295,8 @@ def ask_model_stream(messages: list, tools: list) -> Message:
 
     log_and_stream("\n")
     return Message(
-        role="assistant", content=assembled_content,
+        role="assistant",
+        content=assembled_content,
         tool_calls=sanitize_tool_calls(
             assembled_tool_calls) if assembled_tool_calls else None,
         thinking=assembled_thinking if assembled_thinking else None,
@@ -431,7 +437,10 @@ def execute_single_tool_call(call, max_heals=2) -> tuple[str, ToolResult]:
         heal_call = {
             "function": {
                 "name": "update_tool",
-                "arguments": {"tool_name": resolved_name, "python_code": fixed_code}
+                "arguments": {
+                    "tool_name": resolved_name,
+                    "python_code": fixed_code
+                }
             }
         }
 
@@ -449,10 +458,13 @@ def execute_single_tool_call(call, max_heals=2) -> tuple[str, ToolResult]:
 
 
 def _extract_json_from_text(text: str) -> dict | None:
+    """Helper to robustly extract the first JSON object block from LLM output."""
+    # Try to find a ```json ... ``` block first
     match = re.search(r"```json\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
     if match:
         text = match.group(1)
 
+    # Fallback to finding the first { ... } block
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1 and end > start:
@@ -465,6 +477,7 @@ def _extract_json_from_text(text: str) -> dict | None:
 
 
 def reflect_on_task(user_prompt: str, messages: list):
+    """6.3 Reflection / Post-Mortem"""
     log_and_stream("\n-> [Post-Mortem] Reflecting on task execution...\n")
     reflect_messages = [
         {"role": "system",
@@ -515,7 +528,9 @@ def reflect_on_task(user_prompt: str, messages: list):
         log_and_stream(f"   [Reflection Failed]: {e}\n")
 
 
-def run_agent_loop(user_prompt: str, session_id: str, messages: list = None, turn_count: int = 0, plan: str = "", learnings: list = None) -> tuple[list, int]:
+def run_agent_loop(
+    user_prompt: str, session_id: str, messages: list = None, turn_count: int = 0, plan: str = "", learnings: list = None
+) -> tuple[list, int]:
     log_and_stream(
         f"\n=== User Turn: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     log_and_stream(f"User > {user_prompt}\n\n")
@@ -569,23 +584,34 @@ def run_agent_loop(user_prompt: str, session_id: str, messages: list = None, tur
         tool_calls = assistant_message.tool_calls
         results = []
 
-        current_tool_names = [tc.get("function", {}).get("name")
-                              for tc in tool_calls]
-        tool_call_history.extend(current_tool_names)
+        # Track tool name AND arguments to prevent false loop positives
+        # (e.g., reading multiple different files is not a loop)
+        current_tool_calls = []
+        for tc in tool_calls:
+            func_name = tc.get("function", {}).get("name", "")
+            func_args = tc.get("function", {}).get("arguments", {})
+            try:
+                args_str = json.dumps(func_args, sort_keys=True)
+            except Exception:
+                args_str = str(func_args)
+            current_tool_calls.append((func_name, args_str))
+
+        tool_call_history.extend(current_tool_calls)
+
         loop_detected = False
         if len(tool_call_history) > 3:
             recent_calls = tool_call_history[-3:]
-            if len(set(recent_calls)) == 1 and recent_calls[0] not in META_TOOLS:
+            # A true loop is calling the exact same tool with the exact same arguments
+            if len(set(recent_calls)) == 1 and recent_calls[0][0] not in META_TOOLS:
                 loop_detected = True
                 log_and_stream(
-                    f"\n[Safety] Loop detected: Agent called '{recent_calls[0]}' 3 times in a row. Forcing reflection.\n")
+                    f"\n[Safety] Loop detected: Agent called '{recent_calls[0][0]}' with identical args 3 times in a row. Forcing reflection.\n")
                 for tc in tool_calls:
                     messages.append({
                         "role": "tool",
                         "name": tc.get("function", {}).get("name", ""),
-                        "content": "CRITICAL ERROR: You are stuck in a loop calling this tool. The tool may be returning the wrong data (e.g., metadata instead of actual content). Do NOT call this tool again. Instead, use `update_tool` to fix the tool's logic so it returns the actual content/data the user requested, NOT just metadata or success booleans."
+                        "content": "CRITICAL ERROR: You are stuck in a loop calling this tool with the exact same arguments. The tool may be returning the wrong data (e.g., metadata instead of actual content). Do NOT call this tool again. Instead, use `update_tool` to fix the tool's logic so it returns the actual content/data the user requested, NOT just metadata or success booleans."
                     })
-                # Clear loop history to allow the agent to actually try a new approach
                 tool_call_history.clear()
                 turn_count += 1
                 save_checkpoint(session_id, turn_count, messages)
@@ -594,8 +620,10 @@ def run_agent_loop(user_prompt: str, session_id: str, messages: list = None, tur
         if len(tool_calls) == 1:
             results.append(execute_single_tool_call(tool_calls[0]))
         else:
-            has_meta_tools = any((tc.get("function", {}).get(
-                "name") in META_TOOLS) for tc in tool_calls)
+            has_meta_tools = any(
+                (tc.get("function", {}).get("name") in META_TOOLS)
+                for tc in tool_calls
+            )
             if has_meta_tools:
                 log_and_stream(
                     "-> Detected meta-tools in batch. Forcing sequential execution...\n")
@@ -691,7 +719,9 @@ def main():
             learnings = retrieve_learnings(user_input)
 
             history, turn_count = run_agent_loop(
-                user_input, session_id, history, turn_count, plan, learnings)
+                user_input, session_id, history, turn_count, plan, learnings
+            )
+
             reflect_on_task(user_input, history)
 
         except (KeyboardInterrupt, SystemExit):
