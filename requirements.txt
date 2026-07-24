@@ -1,0 +1,13 @@
+# --- LLM Backend Dependencies ---
+# Used for the default Ollama backend
+ollama
+
+# Used only if OLLAMA_INFRA=False (llama.cpp backend)
+llama-cpp-python
+
+# --- Core Agent Dependencies ---
+# Used in memory.py for accurate token counting during context condensation
+tiktoken
+
+# Used in llm_backend.py to load environment variables from a .env file
+python-dotenv

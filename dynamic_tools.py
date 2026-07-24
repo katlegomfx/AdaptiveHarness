@@ -76,6 +76,34 @@ def validate_python_code(python_code: str) -> Tuple[bool, str]:
         if isinstance(node, ast.FunctionDef):
             if not ast.get_docstring(node):
                 return False, f"Validation Error: Function '{node.name}' must include a docstring."
+            continue
+        if isinstance(node, ast.ClassDef):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.If):
+            test = node.test
+            is_main_check = False
+            if isinstance(test, ast.Compare):
+                if isinstance(test.left, ast.Name) and test.left.id == '__name__':
+                    is_main_check = True
+                elif test.comparators and isinstance(test.comparators[0], ast.Name) and test.comparators[0].id == '__name__':
+                    is_main_check = True
+            if is_main_check:
+                continue
+            return False, "Validation Error: Module-level executable code is prohibited. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Call):
+                return False, "Validation Error: Module-level function calls are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+            continue
+        if isinstance(node, ast.AnnAssign):
+            if isinstance(node.value, ast.Call):
+                return False, "Validation Error: Module-level function calls are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+            continue
+        if isinstance(node, ast.Expr):
+            return False, "Validation Error: Module-level executable expressions (like print()) are prohibited. The sandbox runner calls the function automatically. If you need to test locally, wrap calls in `if __name__ == '__main__':`."
+
+        return False, "Validation Error: Module-level executable code is prohibited. Only use imports, class/function definitions, or `if __name__ == '__main__':`."
 
     # 5.6 validate_python_code Regex for Boolean Returns is Fragile
     for node in ast.walk(tree):
