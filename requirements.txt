@@ -11,3 +11,7 @@ tiktoken
 
 # Used in llm_backend.py to load environment variables from a .env file
 python-dotenv
+
+# --- Optional TUI Dependencies ---
+# Required for --tui flag on Windows. Built-in on Linux/Mac/Termux.
+windows-curses; sys_platform == 'win32'

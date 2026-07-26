@@ -14,7 +14,9 @@ def execute_tool_in_sandbox(
     work_dir: str = None,
 ) -> ToolResult:
     """Executes a dynamic tool in an isolated Python subprocess via STDIN IPC."""
-    runner_code = f"""
+
+    # Pass tool name safely via environment variable to prevent code injection
+    runner_code = """
 import json, sys, io, os, traceback
 from contextlib import redirect_stdout
 
@@ -23,43 +25,46 @@ def trace_exceptions(exc_type, exc_value, tb):
     curr_tb = tb
     while curr_tb:
         frame = curr_tb.tb_frame
-        local_vars = {{
+        local_vars = {
             k: str(v)[:150] for k, v in frame.f_locals.items() 
             if not k.startswith("__")
-        }}
-        frames.append({{
+        }
+        frames.append({
             "file": os.path.basename(frame.f_code.co_filename),
             "line": curr_tb.tb_lineno,
             "function": frame.f_code.co_name,
             "locals": local_vars
-        }})
+        })
         curr_tb = curr_tb.tb_next
 
-    error_payload = {{
+    error_payload = {
         "error_type": exc_type.__name__,
         "message": str(exc_value),
         "execution_trace": frames,
         "formatted_tb": traceback.format_exc()
-    }}
-    print(json.dumps({{"error": error_payload}}))
+    }
+    print(json.dumps({"error": error_payload}))
     sys.exit(1)
 
 sys.excepthook = trace_exceptions
 
 try:
-    # Wrap import to prevent stdout pollution breaking JSON IPC
+    tool_name = os.environ.get("SANDBOX_TOOL_NAME")
+    if not tool_name:
+        raise ValueError("SANDBOX_TOOL_NAME environment variable not set.")
+
     import_buffer = io.StringIO()
     with redirect_stdout(import_buffer):
-        from custom_tools.{tool_name} import {tool_name}
+        module = __import__(f"custom_tools.{tool_name}", fromlist=[tool_name])
+        func = getattr(module, tool_name)
 
     raw_input = sys.stdin.read()
-    args = json.loads(raw_input) if raw_input.strip() else {{}}
+    args = json.loads(raw_input) if raw_input.strip() else {}
 
     exec_buffer = io.StringIO()
     with redirect_stdout(exec_buffer):
-        result = {tool_name}(**args)
+        result = func(**args)
 
-    # Combine import logs and execution logs
     tool_logs = import_buffer.getvalue().strip()
     if tool_logs:
         tool_logs += "\\n"
@@ -68,7 +73,7 @@ try:
     if isinstance(result, bool):
         result = "Success" if result else "Completed but returned False"
 
-    out_payload = {{"result": str(result)}}
+    out_payload = {"result": str(result)}
     if tool_logs:
         out_payload["logs"] = tool_logs
 
@@ -81,6 +86,7 @@ except Exception as e:
     payload = json.dumps(args)
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
+    env["SANDBOX_TOOL_NAME"] = tool_name  # Safely pass the tool name
 
     cwd = os.getcwd()
     if "PYTHONPATH" in env:

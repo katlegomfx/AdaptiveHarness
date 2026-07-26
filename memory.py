@@ -1,4 +1,5 @@
-# 3.5 Token-Based Memory Condensation
+# memory.py
+import os
 from llm_backend import chat
 
 
@@ -10,6 +11,7 @@ def condense_history(
     log_stream_func=None,
 ) -> list:
     """Summarizes older conversation turns while streaming visible output to stdout/log."""
+    enc = None
     try:
         import tiktoken
         try:
@@ -17,7 +19,7 @@ def condense_history(
         except Exception:
             enc = tiktoken.get_encoding("cl100k_base")
     except Exception:
-        enc = None
+        pass
 
     def count_tokens(text):
         if enc:
@@ -55,9 +57,16 @@ def condense_history(
     else:
         print(header_msg)
 
+    think_enabled = os.environ.get(
+        "THINK_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
     summary_content = ""
     try:
-        stream = chat(model=model_name, messages=summary_prompt, stream=True)
+        stream = chat(model=model_name, messages=summary_prompt,
+                      think=think_enabled, stream=True)
+
+        in_thinking = False
+        in_content = False
+
         for chunk in stream:
             msg = (
                 chunk.get("message")
@@ -66,15 +75,38 @@ def condense_history(
             )
             if not msg:
                 continue
+
+            chunk_thinking = getattr(msg, "thinking", None) or (
+                msg.get("thinking") if isinstance(msg, dict) else None)
             content = getattr(msg, "content", None) or (
-                msg.get("content") if isinstance(msg, dict) else None
-            )
+                msg.get("content") if isinstance(msg, dict) else None)
+
+            if chunk_thinking:
+                if not in_thinking:
+                    in_thinking = True
+                    if log_stream_func:
+                        log_stream_func("\n[Thinking]\n")
+                    else:
+                        print("\n[Thinking]\n", end="")
+                if log_stream_func:
+                    log_stream_func(chunk_thinking)
+                else:
+                    print(chunk_thinking, end="")
+
             if content:
-                summary_content += content
+                if in_thinking:
+                    in_thinking = False
+                    if log_stream_func:
+                        log_stream_func("\n[Summary]\n")
+                    else:
+                        print("\n[Summary]\n", end="")
+                if not in_content:
+                    in_content = True
                 if log_stream_func:
                     log_stream_func(content)
                 else:
                     print(content, end="", flush=True)
+                summary_content += content
 
         done_msg = "\n-> [Memory Condenser] Context compression complete.\n"
         if log_stream_func:

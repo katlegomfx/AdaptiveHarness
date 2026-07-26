@@ -1,5 +1,6 @@
+# llm_backend.py
 """
-llm_backend.py — Single-toggle LLM backend (Ollama or llama.cpp).
+llm_backend.py — Single-toggle LLM backend (Ollama via urllib or llama.cpp) + Embeddings.
 """
 import json
 import os
@@ -10,8 +11,12 @@ import urllib.request
 import urllib.error
 import inspect
 import typing
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional
+
+IS_TERMUX = os.environ.get("PREFIX", "").startswith(
+    "/data/data/com.termux") or os.path.exists("/data/data/com.termux/files/usr")
 
 try:
     from dotenv import load_dotenv
@@ -21,10 +26,13 @@ except ImportError:
 
 OLLAMA_INFRA: bool = os.environ.get(
     "OLLAMA_INFRA", "True").strip().lower() in ("true", "1", "yes", "on",)
+if IS_TERMUX:
+    OLLAMA_INFRA = True
+
 OLLAMA_BASE_URL: str = os.environ.get(
     "OLLAMA_BASE_URL", "http://localhost:11434")
 MODELS_DIR: str = os.environ.get("LLAMACPP_MODELS_DIR", os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "models"),)
+    os.path.dirname(os.path.abspath(__file__)), "models"))
 LLAMACPP_N_CTX: int = int(os.environ.get("LLAMACPP_N_CTX", "8192"))
 LLAMACPP_N_GPU_LAYERS: int = int(os.environ.get("LLAMACPP_N_GPU_LAYERS", "-1"))
 LLAMACPP_N_THREADS: int = int(os.environ.get("LLAMACPP_N_THREADS", "0"))
@@ -32,10 +40,11 @@ LLAMACPP_N_THREADS: int = int(os.environ.get("LLAMACPP_N_THREADS", "0"))
 MODEL_MAP: Dict[str, Dict[str, str]] = {
     "ornith": {"gguf": "ornith.gguf", "ollama": "ornith"},
 }
-assert len(MODEL_MAP) == len(set(MODEL_MAP)), "Duplicate keys in MODEL_MAP"
+EMBEDDING_MODEL: str = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 
-# Thread safety lock for local llama.cpp execution
 _llamacpp_lock = threading.Lock()
+_llamacpp_models: Dict[str, str] = {}
+_llamacpp_instances: Dict[str, Any] = {}
 
 
 @dataclass
@@ -72,9 +81,6 @@ def _scan_gguf() -> Dict[str, str]:
     return found
 
 
-_llamacpp_models: Dict[str, str] = {}
-_llamacpp_instances: Dict[str, Any] = {}
-
 if OLLAMA_INFRA:
     if _check_ollama():
         print("[LLM Backend] OLLAMA_INFRA=True  ·  Ollama reachable ✓")
@@ -84,38 +90,43 @@ if OLLAMA_INFRA:
         sys.exit(1)
 else:
     try:
-        import llama_cpp  # noqa: F401
+        import llama_cpp
     except ImportError:
-        print("\n[LLM Backend] llama-cpp-python is not installed.\n")
-        sys.exit(1)
+        print(
+            "\n[LLM Backend] llama-cpp-python is not installed. Switching to Ollama HTTP mode.\n")
+        OLLAMA_INFRA = True
+        if not _check_ollama():
+            print(
+                f"\n[LLM Backend] Ollama is NOT responding at {OLLAMA_BASE_URL}. Cannot proceed.\n")
+            sys.exit(1)
+        else:
+            print("[LLM Backend] Ollama reachable ✓ (Fallback)")
+    else:
+        _llamacpp_models = _scan_gguf()
+        if not _llamacpp_models:
+            print(
+                "\n[LLM Backend] No matching .gguf files found. Switching to Ollama HTTP mode.\n")
+            OLLAMA_INFRA = True
+            if not _check_ollama():
+                sys.exit(1)
+        else:
+            print(
+                f"[LLM Backend] llama.cpp ready ✓  ·  models: {list(_llamacpp_models.keys())}")
 
-    _llamacpp_models = _scan_gguf()
-    if not _llamacpp_models:
-        print("\n[LLM Backend] No matching .gguf files found.\n")
-        sys.exit(1)
 
-    print(
-        f"[LLM Backend] llama.cpp ready ✓  ·  models: {list(_llamacpp_models.keys())}")
-
-
-def is_ollama() -> bool:
-    return OLLAMA_INFRA
+def is_ollama() -> bool: return OLLAMA_INFRA
 
 
 def available_models() -> List[str]:
-    if OLLAMA_INFRA:
-        return list(MODEL_MAP.keys())
-    return list(_llamacpp_models.keys())
+    return list(MODEL_MAP.keys()) if OLLAMA_INFRA else list(_llamacpp_models.keys())
 
 
 def _get_llama(model_name: str):
     if model_name in _llamacpp_instances:
         return _llamacpp_instances[model_name]
-
     path = _llamacpp_models.get(model_name)
     if not path:
         raise ValueError(f"Model '{model_name}' not found.")
-
     import llama_cpp
     print(f"[LLM Backend] Loading '{model_name}'...", end=" ", flush=True)
     t0 = time.time()
@@ -125,7 +136,6 @@ def _get_llama(model_name: str):
     }
     if LLAMACPP_N_THREADS > 0:
         kwargs["n_threads"] = LLAMACPP_N_THREADS
-
     instance = llama_cpp.Llama(**kwargs)
     print(f"done ({time.time() - t0:.1f}s)")
     _llamacpp_instances[model_name] = instance
@@ -175,10 +185,7 @@ def _tools_to_openai(tools: Optional[List[Any]]) -> Optional[List[Dict]]:
     return out or None
 
 
-def chat(
-    model: str, messages: List[Dict[str, Any]], tools: Optional[List[Any]] = None,
-    think: bool = False, stream: bool = True
-) -> Generator[Dict[str, Any], None, None]:
+def chat(model: str, messages: List[Dict[str, Any]], tools: Optional[List[Any]] = None, think: bool = False, stream: bool = True) -> Generator[Dict[str, Any], None, None]:
     if OLLAMA_INFRA:
         yield from _chat_ollama(model, messages, tools, think, stream)
     else:
@@ -186,17 +193,79 @@ def chat(
 
 
 def _chat_ollama(model, messages, tools, think, stream):
-    from ollama import chat as ollama_chat
     resolved = MODEL_MAP.get(model, {}).get("ollama", model)
-    # Ollama server handles concurrent requests natively
-    for chunk in ollama_chat(model=resolved, messages=messages, tools=tools, think=think, stream=stream):
-        yield chunk
+    openai_tools = _tools_to_openai(tools)
+
+    payload = {
+        "model": resolved,
+        "messages": messages,
+        "stream": True
+    }
+    if openai_tools:
+        payload["tools"] = openai_tools
+    if think:
+        payload["think"] = think
+
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=None)
+    except urllib.error.HTTPError as e:
+        # Read the error body for Ollama's detailed message
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise urllib.error.HTTPError(
+            e.url, e.code,
+            f"{e.reason} | Model: {resolved} | think: {think} | tools: {bool(openai_tools)} | Body: {error_body}",
+            e.headers, None
+        )
+
+    with resp:
+        tool_calls_buf = {}
+        for line in resp:
+            # ... rest unchanged ...
+            if not line.strip():
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = chunk.get("message", {})
+            content = msg.get("content")
+            thinking = msg.get("thinking")
+            tcs = msg.get("tool_calls")
+
+            if content:
+                yield {"message": {"role": "assistant", "content": content, "thinking": None, "tool_calls": None}}
+            if thinking:
+                yield {"message": {"role": "assistant", "content": None, "thinking": thinking, "tool_calls": None}}
+
+            if tcs:
+                for i, tc in enumerate(tcs):
+                    args = tc.get("function", {}).get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except:
+                            pass
+                    tc["function"]["arguments"] = args
+                    tool_calls_buf[i] = tc
+
+            if chunk.get("done"):
+                break
+
+    if tool_calls_buf:
+        final_tcs = [tool_calls_buf[i] for i in sorted(tool_calls_buf.keys())]
+        yield {"message": {"role": "assistant", "content": None, "thinking": None, "tool_calls": final_tcs}}
 
 
 def _chat_llamacpp(model, messages, tools, think, stream):
     instance = _get_llama(model)
     openai_tools = _tools_to_openai(tools)
-
     kwargs: Dict[str, Any] = {
         "messages": messages, "stream": True, "temperature": 0.6, "top_p": 0.9,
     }
@@ -204,7 +273,6 @@ def _chat_llamacpp(model, messages, tools, think, stream):
         kwargs["tools"] = openai_tools
         kwargs["tool_choice"] = "auto"
 
-    # Serialize llama.cpp calls to prevent thread crashes (segfaults)
     with _llamacpp_lock:
         raw = instance.create_chat_completion(**kwargs)
         tc_buf: Dict[int, Dict[str, Any]] = {}
@@ -243,15 +311,46 @@ def _chat_llamacpp(model, messages, tools, think, stream):
 
 def chat_sync(model: str, messages: List[Dict], tools=None, think=False) -> Message:
     if OLLAMA_INFRA:
-        from ollama import chat as ollama_chat
         resolved = MODEL_MAP.get(model, {}).get("ollama", model)
-        resp = ollama_chat(model=resolved, messages=messages,
-                           tools=tools, think=think, stream=False)
-        m = resp.get("message", resp) if isinstance(resp, dict) else resp
-        return Message(
-            role=getattr(m, "role", "assistant"), content=getattr(m, "content", None),
-            tool_calls=getattr(m, "tool_calls", None), thinking=getattr(m, "thinking", None),
+        openai_tools = _tools_to_openai(tools)
+        payload = {
+            "model": resolved,
+            "messages": messages,
+            "stream": False
+        }
+        if openai_tools:
+            payload["tools"] = openai_tools
+        if think:
+            payload["think"] = think
+
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
         )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                m = json.loads(resp.read())
+                msg = m.get("message", m)
+                tcs = msg.get("tool_calls")
+                if tcs:
+                    for tc in tcs:
+                        args = tc.get("function", {}).get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except:
+                                pass
+                        tc["function"]["arguments"] = args
+                return Message(
+                    role=msg.get("role", "assistant"),
+                    content=msg.get("content"),
+                    tool_calls=tcs,
+                    thinking=msg.get("thinking")
+                )
+        except Exception as e:
+            return Message(role="assistant", content=f"Error: {str(e)}")
     else:
         parts_c, parts_t, final_tc = [], [], None
         for chunk in chat(model, messages, tools, think, stream=True):
@@ -266,3 +365,39 @@ def chat_sync(model: str, messages: List[Dict], tools=None, think=False) -> Mess
             role="assistant", content="".join(parts_c) or None,
             tool_calls=final_tc, thinking="".join(parts_t) or None,
         )
+
+
+def get_embedding(text: str, model: str = None) -> List[float]:
+    """Fetches embedding vector for a given text using standard urllib."""
+    if not text.strip():
+        return []
+    # Use dedicated embedding model, not the chat model
+    emb_model = model if model and model != "ornith" else EMBEDDING_MODEL
+    if OLLAMA_INFRA:
+        try:
+            resolved = MODEL_MAP.get(emb_model, {}).get("ollama", emb_model)
+            payload = {"model": resolved, "prompt": text}
+            req = urllib.request.Request(
+                f"{OLLAMA_BASE_URL}/api/embeddings",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                return data.get("embedding", [])
+        except Exception as e:
+            print(f"[Embedding Error]: {e}")
+            return []
+    else:
+        return []
+
+def cosine_similarity(v1: List[float], v2: List[float]) -> float:
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    norm1 = math.sqrt(sum(a * a for a in v1))
+    norm2 = math.sqrt(sum(b * b for b in v2))
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot / (norm1 * norm2)
