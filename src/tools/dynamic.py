@@ -1,58 +1,20 @@
-# dynamic_tools.py
-import json
-import signal
-import subprocess
+# src/tools/dynamic.py
 import ast
 import importlib
 import inspect
-import math
+import json
 import os
 import re
-import shutil
 import sys
 import threading
-import time
-from typing import Callable, Dict, List, Tuple
-from runtime.result import ResultStatus
+from typing import Callable, List, Tuple
 
-TOOL_REGISTRY: Dict[str, Callable] = {}
-REGISTRY_LOCK = threading.RLock()
+from src.config import CUSTOM_TOOLS_DIR
+from src.tools.registry import TOOL_REGISTRY, REGISTRY_LOCK, register_tool
+
 CUSTOM_TOOLS_WRITE_LOCK = threading.RLock()
-CUSTOM_TOOLS_DIR = os.path.join(os.path.dirname(__file__), "custom_tools")
-
-META_TOOLS = {"create_tool", "update_tool", "edit_source_file", "write_file"}
-
 BANNED_IMPORTS = {"ctypes", "pickle", "socket", "builtins"}
 BANNED_FUNCTIONS = {"eval", "exec", "compile", "__import__"}
-
-
-PROCESS_REGISTRY_FILE = "process_registry.json"
-
-SECRETS_FILE = ".agent_secrets.json"
-
-
-def _load_secrets() -> Dict[str, str]:
-    if os.path.exists(SECRETS_FILE):
-        with open(SECRETS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def _save_secrets(secrets: Dict[str, str]):
-    with open(SECRETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(secrets, f, indent=2)
-
-
-def _update_process_registry(processes: dict):
-    with open(PROCESS_REGISTRY_FILE, "w", encoding="utf-8") as f:
-        json.dump(processes, f, indent=2)
-
-
-def _load_process_registry() -> dict:
-    if os.path.exists(PROCESS_REGISTRY_FILE):
-        with open(PROCESS_REGISTRY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
 
 
 class SecurityASTVisitor(ast.NodeVisitor):
@@ -88,12 +50,6 @@ class SecurityASTVisitor(ast.NodeVisitor):
             self.violations.append(
                 f"Security Violation: Dynamic evaluation call '{func_name}()' is prohibited.")
         self.generic_visit(node)
-
-
-def register_tool(func: Callable):
-    with REGISTRY_LOCK:
-        TOOL_REGISTRY[func.__name__] = func
-    return func
 
 
 def validate_python_code(python_code: str) -> Tuple[bool, str]:
@@ -170,7 +126,7 @@ def check_semantic_duplicates(new_name: str, new_doc: str, threshold: float = 0.
             existing_doc = inspect.getdoc(func) or ""
 
             try:
-                from llm_backend import get_embedding, cosine_similarity
+                from src.llm_backend import get_embedding, cosine_similarity
                 v1 = get_embedding(new_name + " " + new_doc)
                 v2 = get_embedding(name + " " + existing_doc)
                 sim = cosine_similarity(v1, v2)
@@ -229,41 +185,6 @@ def load_persisted_tools():
                 print(f"[Registry] Failed loading '{filename}': {e}")
 
 
-def get_relevant_tools(user_query: str, top_k: int = 5) -> list[Callable]:
-    with REGISTRY_LOCK:
-        tools = list(TOOL_REGISTRY.values())
-        if len(tools) <= top_k:
-            return tools
-
-        query_tokens = set(re.findall(r"\w+", user_query.lower()))
-        scored_tools = []
-        meta_tools_found = []
-
-        for func in tools:
-            name = func.__name__
-            if name in META_TOOLS:
-                meta_tools_found.append(func)
-                continue
-
-            doc = inspect.getdoc(func) or ""
-            text = f"{name} {doc}".lower()
-            text_tokens = set(re.findall(r"\w+", text))
-            overlap = len(query_tokens.intersection(text_tokens))
-            score = overlap / \
-                math.sqrt(len(text_tokens) + 1) if text_tokens else 0.0
-            scored_tools.append((score, func))
-
-        scored_tools.sort(key=lambda x: x[0], reverse=True)
-
-        dynamic_to_take = top_k - len(meta_tools_found)
-        if dynamic_to_take < 0:
-            dynamic_to_take = 0
-
-        result = meta_tools_found + [func for _,
-                                     func in scored_tools[:dynamic_to_take]]
-        return result[:top_k]
-
-
 def _extract_sample_args(test_inputs):
     sample_args_list = test_inputs if isinstance(
         test_inputs, list) else [test_inputs]
@@ -297,8 +218,8 @@ def _extract_sample_args(test_inputs):
 @register_tool
 def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> str:
     """Creates, registers, and persists a brand-new Python tool after 3-stage validation."""
-    from sandbox import execute_tool_in_sandbox
-    from safety_net import snapshot, revert
+    from src.tools.sandbox import execute_tool_in_sandbox
+    from src.safety_net import snapshot, revert
 
     is_valid, validation_msg = validate_python_code(python_code)
     if not is_valid:
@@ -364,8 +285,8 @@ def create_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
 @register_tool
 def update_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> str:
     """Updates an existing tool in the registry after security and sandbox validation."""
-    from sandbox import execute_tool_in_sandbox
-    from safety_net import snapshot, revert
+    from src.tools.sandbox import execute_tool_in_sandbox
+    from src.safety_net import snapshot, revert
 
     is_valid, validation_msg = validate_python_code(python_code)
     if not is_valid:
@@ -425,7 +346,7 @@ def update_tool(tool_name: str, python_code: str, test_inputs: dict = None) -> s
 @register_tool
 def edit_source_file(filepath: str, search_string: str, replace_string: str, **kwargs) -> str:
     """Applies a precise string replacement patch to a local project file."""
-    from safety_net import snapshot, revert, validate_python_syntax
+    from src.safety_net import snapshot, revert, validate_python_syntax
 
     if not os.path.exists(filepath):
         return f"Error: File '{filepath}' not found."
@@ -456,230 +377,5 @@ def edit_source_file(filepath: str, search_string: str, replace_string: str, **k
     return f"Successfully patched '{filepath}'. 1 replacement made."
 
 
-@register_tool
-def write_file(filepath: str, content: str, **kwargs) -> str:
-    """Writes content to a file, creating parent directories if needed."""
-    dir_name = os.path.dirname(filepath)
-    if dir_name:
-        os.makedirs(dir_name, exist_ok=True)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-    return f"Successfully wrote {len(content)} characters to {filepath}."
-
-
-@register_tool
-def read_file(filepath: str, **kwargs) -> str:
-    """Reads the content of a file and returns it as a string."""
-    if not os.path.exists(filepath):
-        return f"Error: File '{filepath}' not found."
-    if os.path.isdir(filepath):
-        return f"Error: '{filepath}' is a directory, not a file."
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception as e:
-        return f"Error reading file '{filepath}': {str(e)}"
-
-
-@register_tool
-def list_directory(path: str = ".", **kwargs) -> str:
-    """Lists all files and folders in the specified directory path. Defaults to current directory."""
-    if not os.path.exists(path):
-        return f"Error: Directory '{path}' not found."
-    if not os.path.isdir(path):
-        return f"Error: '{path}' is not a directory."
-    try:
-        entries = os.listdir(path)
-        return str(entries)
-    except Exception as e:
-        return f"Error listing directory '{path}': {str(e)}"
-
-
-@register_tool
-def delete_file(filepath: str, **kwargs) -> str:
-    """Deletes a file. Can also delete empty directories."""
-    if not os.path.exists(filepath):
-        return f"Error: Path '{filepath}' not found."
-    try:
-        if os.path.isfile(filepath):
-            os.remove(filepath)
-            return f"Successfully deleted file '{filepath}'."
-        elif os.path.isdir(filepath):
-            os.rmdir(filepath)  # Only removes empty directories
-            return f"Successfully deleted empty directory '{filepath}'."
-        else:
-            return f"Error: '{filepath}' is neither a file nor a directory."
-    except Exception as e:
-        return f"Error deleting '{filepath}': {str(e)}"
-
-
-@register_tool
-def make_directory(path: str, **kwargs) -> str:
-    """Creates a new directory, including parent directories if they don't exist."""
-    try:
-        os.makedirs(path, exist_ok=True)
-        return f"Successfully created directory '{path}'."
-    except Exception as e:
-        return f"Error creating directory '{path}': {str(e)}"
-
-
-@register_tool
-def move_file(source: str, destination: str, **kwargs) -> str:
-    """Moves or renames a file or directory from source to destination."""
-    if not os.path.exists(source):
-        return f"Error: Source '{source}' not found."
-    try:
-        shutil.move(source, destination)
-        return f"Successfully moved '{source}' to '{destination}'."
-    except Exception as e:
-        return f"Error moving '{source}' to '{destination}': {str(e)}"
-
-
-@register_tool
-def copy_file(source: str, destination: str, **kwargs) -> str:
-    """Copies a file or directory from source to destination."""
-    if not os.path.exists(source):
-        return f"Error: Source '{source}' not found."
-    try:
-        if os.path.isdir(source):
-            shutil.copytree(source, destination)
-        else:
-            shutil.copy2(source, destination)
-        return f"Successfully copied '{source}' to '{destination}'."
-    except Exception as e:
-        return f"Error copying '{source}' to '{destination}': {str(e)}"
-
-
-@register_tool
-def get_file_info(filepath: str, **kwargs) -> str:
-    """Retrieves metadata (size, modification time) for a file or directory."""
-    if not os.path.exists(filepath):
-        return f"Error: Path '{filepath}' not found."
-    try:
-        stat_info = os.stat(filepath)
-        size = stat_info.st_size
-        mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
-        return f"Path: {filepath}\nSize: {size} bytes\nModified: {mtime}"
-    except Exception as e:
-        return f"Error getting info for '{filepath}': {str(e)}"
-
-
-@register_tool
-def start_background_process(script_path: str, **kwargs) -> str:
-    """Starts a Python script as a long-running background process. Returns the PID."""
-    if not os.path.exists(script_path):
-        return f"Error: Script '{script_path}' not found."
-
-    log_file = f"{os.path.basename(script_path)}.log"
-    log_fh = open(log_file, "a", encoding="utf-8")
-
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, script_path],
-            stdout=log_fh,
-            stderr=log_fh,
-            cwd=os.getcwd()
-        )
-
-        registry = _load_process_registry()
-        registry[str(proc.pid)] = {
-            "script": script_path,
-            "log_file": log_file,
-            "status": "running"
-        }
-        _update_process_registry(registry)
-
-        return f"Successfully started background process. PID: {proc.pid}. Logs writing to {log_file}."
-    except Exception as e:
-        return f"Failed to start process: {str(e)}"
-
-
-@register_tool
-def check_process_status(pid: str, **kwargs) -> str:
-    """Checks the status and last 10 lines of logs for a background process."""
-    registry = _load_process_registry()
-    if pid not in registry:
-        return f"Error: Process {pid} not found in registry."
-
-    info = registry[pid]
-    log_file = info["log_file"]
-
-    try:
-        os.kill(int(pid), 0)
-        status = "running"
-    except OSError:
-        status = "stopped/dead"
-        info["status"] = status
-        _update_process_registry(registry)
-
-    logs = "(No logs found)"
-    if os.path.exists(log_file):
-        with open(log_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            logs = "".join(lines[-10:])
-
-    return f"Process {pid} Status: {status}\nLast 10 log lines:\n{logs}"
-
-
-@register_tool
-def stop_background_process(pid: str, **kwargs) -> str:
-    """Terminates a running background process by PID."""
-    registry = _load_process_registry()
-    if pid not in registry:
-        return f"Error: Process {pid} not found in registry."
-
-    try:
-        os.kill(int(pid), signal.SIGTERM)
-        registry[pid]["status"] = "terminated"
-        _update_process_registry(registry)
-        return f"Successfully sent SIGTERM to process {pid}."
-    except Exception as e:
-        return f"Failed to stop process {pid}: {str(e)}"
-
-
-@register_tool
-def install_package(package_name: str, **kwargs) -> str:
-    """Installs a Python package using pip in the current environment."""
-    if not package_name or " " in package_name:
-        return "Error: Invalid package name."
-
-    if ";" in package_name or "&" in package_name or "|" in package_name:
-        return "Error: Invalid characters in package name."
-
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", package_name],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        if result.returncode == 0:
-            return f"Successfully installed '{package_name}'."
-        else:
-            return f"Failed to install '{package_name}'.\nStderr: {result.stderr}"
-    except Exception as e:
-        return f"Error running pip install: {str(e)}"
-
-
-@register_tool
-def set_secret(key: str, value: str, **kwargs) -> str:
-    """Saves a secret (like an API key or password) securely to the agent's secrets file."""
-    if not key or not value:
-        return "Error: Key and value must be provided."
-
-    secrets = _load_secrets()
-    secrets[key] = value
-    _save_secrets(secrets)
-    return f"Secret '{key}' saved successfully."
-
-
-@register_tool
-def get_secret(key: str, **kwargs) -> str:
-    """Retrieves a saved secret by its key."""
-    secrets = _load_secrets()
-    if key in secrets:
-        return secrets[key]
-    return f"Error: Secret '{key}' not found."
-
-
+# Initialize dynamic tools on load
 load_persisted_tools()

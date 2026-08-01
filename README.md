@@ -25,7 +25,7 @@ pip install -r requirements.txt
 # 2. Configure your backend and models (.env)
 # By default, it uses Ollama. To use llama.cpp instead:
 #    Change OLLAMA_INFRA=False in .env
-#    Place your .gguf models in the ./models/ directory
+#    Place your .gguf models in the ./llms/ directory
 
 # 3. Run new agent session (Default: scheduled mode, 2-min idle timeout)
 python start.py

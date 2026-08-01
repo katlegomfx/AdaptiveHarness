@@ -11,7 +11,8 @@ class StdoutRedirector:
         self.tui = tui
 
     def write(self, text):
-        if text.strip():
+        # IMPROVEMENT: Only drop completely empty strings, allow newlines/whitespace
+        if text:
             self.tui.render_q.put(text)
 
     def flush(self):
@@ -26,25 +27,47 @@ class CursesTUI:
         self.stdscr.keypad(True)
         curses.curs_set(0)  # Hide cursor initially
         self.render_q = queue.Queue()
+        self.memory_q = queue.Queue()
         self._update_layout()
 
     def _update_layout(self):
         self.height, self.width = self.stdscr.getmaxyx()
-        self.chat_height = self.height - 4
+
+        # Input window at the bottom (3 lines)
+        self.input_height = 3
+        # Memory window above input (7 lines)
+        self.memory_height = 7
+        # Chat window takes the rest
+        self.chat_height = self.height - self.input_height - self.memory_height
         if self.chat_height < 1:
             self.chat_height = 1
 
+        # Chat Window
         self.chat_win = curses.newwin(self.chat_height, self.width, 0, 0)
         self.chat_win.scrollok(True)
         self.chat_win.refresh()
 
-        self.input_win = curses.newwin(4, self.width, self.chat_height, 0)
+        # Memory Window
+        self.memory_win = curses.newwin(
+            self.memory_height, self.width, self.chat_height, 0)
+        self.memory_win.scrollok(True)
+        self.memory_win.box()
+        self.memory_win.addstr(0, 1, " Memory & Summaries ")
+        self.memory_win.refresh()
+
+        # Input Window
+        self.input_win = curses.newwin(
+            self.input_height, self.width, self.chat_height + self.memory_height, 0)
         self.input_win.box()
         self.input_win.refresh()
 
     def stream_handler(self, text: str):
-        """Callback for agent.emit()"""
-        self.render_q.put(text)
+        """Callback for agent.emit(). Routes text to appropriate window."""
+        # Route summarizer thoughts and reflections to the memory window
+        if "Memory Condenser" in text or "[Summary]" in text or "Learnings" in text or "Reflection" in text:
+            self.memory_q.put(text)
+        else:
+            self.render_q.put(text)
 
     def input_handler(self, prompt: str) -> str:
         """Synchronous input for HITL approvals."""
@@ -58,7 +81,8 @@ class CursesTUI:
         curses.echo()
         curses.curs_set(1)
         try:
-            raw = self.input_win.getstr(2, 1).decode('utf-8')
+            # Read input starting after the prompt
+            raw = self.input_win.getstr(1, len(prompt) + 1).decode('utf-8')
         except:
             raw = ""
         curses.curs_set(0)
@@ -119,7 +143,8 @@ class CursesTUI:
         return input_str
 
     def render_loop(self):
-        """Drain the render queue and update the chat window."""
+        """Drain the render queues and update windows."""
+        # 1. Update Chat Window
         while True:
             try:
                 text = self.render_q.get_nowait()
@@ -127,6 +152,24 @@ class CursesTUI:
             except queue.Empty:
                 break
         self.chat_win.refresh()
+
+        # 2. Update Memory Window
+        while True:
+            try:
+                text = self.memory_q.get_nowait()
+                # Scroll the memory window up by 1 line, keeping the box intact
+                self.memory_win.scroll(1)
+                self.memory_win.move(self.memory_height - 2, 1)
+                self.memory_win.clrtoeol()
+                self.memory_win.addstr(
+                    self.memory_height - 2, 1, text[:self.width-2])
+                self.memory_win.box()
+                self.memory_win.addstr(0, 1, " Memory & Summaries ")
+            except queue.Empty:
+                break
+        self.memory_win.refresh()
+
+        # 3. Refresh Input Window
         self.input_win.box()
         self.input_win.refresh()
 

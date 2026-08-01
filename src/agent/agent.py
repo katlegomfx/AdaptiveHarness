@@ -1,71 +1,51 @@
-# main.py
-import argparse
-import signal
-from concurrent.futures import ThreadPoolExecutor
-import datetime
-import inspect
-import json
-import os
-import re
-import sys
-import uuid
-import atexit
-import time
-import logging
-from typing import Callable, Optional, List, Dict, Any
-import urllib.error
-from dotenv import load_dotenv
-
-import dynamic_tools
-from dynamic_tools import REGISTRY_LOCK, TOOL_REGISTRY, get_relevant_tools
-from memory import condense_history
-from llm_backend import Message, chat, chat_sync, is_ollama, get_embedding
-from sandbox import execute_tool_in_sandbox
-from storage import init_db, list_sessions, load_latest_checkpoint, save_checkpoint, save_learning, retrieve_learnings, add_long_term_goal
-from runtime.result import ToolResult, ResultStatus
-from observability.logger import logger, JsonFormatter
-from observability.metrics import metrics
-
-load_dotenv()
-
-# Load model configurations from environment variables, fallback to "ornith"
-REASONING_MODEL = os.environ.get("REASONING_MODEL", "ornith")
-META_PROMPT_MODEL = os.environ.get("META_PROMPT_MODEL", "ornith")
-TESTER_MODEL = os.environ.get("TESTER_MODEL", "ornith")
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "ornith")
-THINK_ENABLED = os.environ.get(
-    "THINK_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
-LOG_FILE_PATH = "agent_execution.log"
-
-MAX_HEAL_RETRIES = 2
-MAX_AGENT_ITERATIONS = 25
-META_TOOLS = ("create_tool", "update_tool", "edit_source_file", "write_file")
-
-BASE_SYSTEM_PROMPT = (
-    "You are an autonomous AI agent framework running in a Python environment.\n"
-    "1. If the user asks for information or an action for which NO tool exists, you MUST call `create_tool`.\n"
-    "2. CRITICAL - FUNCTION FORMAT: `python_code` MUST contain a complete `def` definition.\n"
-    "3. FLEXIBLE SIGNATURES: Always include `**kwargs` as the final parameter.\n"
-    "4. PARAMETER INVOCATION: BEFORE calling any registered tool, inspect its required arguments.\n"
-    "5. RECOVERY: If `create_tool` returns an error, analyze the trace and call `create_tool` again with corrected code.\n"
-    "6. EXECUTION LOOP: Once `create_tool` succeeds, call the newly registered tool.\n"
-    "7. FILE I/O ENCODING: ALWAYS specify encoding='utf-8' explicitly.\n"
-    "8. ERROR REPORTING: Tools MUST return descriptive error strings on failure, never bare booleans.\n"
-    "9. EXISTING TOOLS: Before creating a tool, check if a tool with similar capabilities already exists.\n"
-    "10. SELF-HEALING: If a tool execution fails with a traceback, the system will attempt to automatically patch the tool code.\n"
-    "11. SELF-IMPROVEMENT: You can edit your own core source files using `edit_source_file`.\n"
-    "12. TOOL OUTPUT QUALITY: Tools MUST return the actual data the user requested (e.g., file contents, search results, calculations), NOT just metadata (like success booleans or content lengths). If a tool returns metadata instead of content, it is broken.\n"
-    "13. TOOL CORRECTION: If a tool runs successfully but returns the wrong data format (e.g., returning a dictionary when a string is expected), you MUST use `update_tool` to fix the return statement immediately.\n"
-    "14. NO MODULE-LEVEL EXECUTION: Do NOT include module-level executable code (like calling the function or printing) in `python_code`. The sandbox runner imports the module and calls the function automatically. If you want to include local tests, wrap them in `if __name__ == '__main__':`.\n"
-    "15. STANDALONE SCRIPTS & FILES: If the user asks you to create a file, script, or project, use the `write_file` tool. Do NOT use `create_tool` for creating static files or standalone scripts. `create_tool` is ONLY for creating reusable Python functions that you will call repeatedly.\n"
+from src.config import (
+    LOG_FILE_PATH, JSON_LOG_PATH, PATCH_DIR,
+    REASONING_MODEL, META_PROMPT_MODEL, TESTER_MODEL, SUMMARY_MODEL, THINK_ENABLED, CUSTOM_TOOLS_DIR, IMPROVEMENT_GUIDE_PATH,
+    REASONING_TEMP, META_PROMPT_TEMP, TESTER_TEMP  # <--- ADD THIS
 )
+from src.agent.context import build_aspect_context
+from src.memory.storage import save_aspect_memory
+from src.agent.prompts import BASE_SYSTEM_PROMPT
+from src.memory.reflection import reflect_on_task, _extract_json_from_text
+from src.agent.planner import generate_plan, generate_dynamic_system_prompt
+from src.core.metrics import metrics
+from src.core.logger import logger, JsonFormatter
+from src.core.result import ToolResult, ResultStatus
+from src.tools.sandbox import execute_tool_in_sandbox
+from src.llm_backend import Message, chat, get_embedding
+from src.memory.storage import (
+    save_checkpoint, retrieve_learnings, retrieve_summaries, save_summary,
+    load_latest_checkpoint, save_learning
+)
+from src.memory.condenser import condense_history
+from src.tools.registry import (
+    REGISTRY_LOCK, TOOL_REGISTRY, get_relevant_tools, is_builtin_tool, META_TOOLS,
+)
+from typing import Callable, Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+import urllib.error
+import logging
+import time
+import atexit
+import uuid
+import sys
+import re
+import os
+import json
+import inspect
+import datetime
+import ast
+
+
+MAX_AGENT_ITERATIONS = 25
+MAX_HEAL_RETRIES = 2
 
 _log_fh = open(LOG_FILE_PATH, "a", encoding="utf-8", buffering=1)
 atexit.register(_log_fh.close)
 
-handler = logging.FileHandler("agent.jsonl")
-handler.setFormatter(JsonFormatter())
-logger.addHandler(handler)
+_handler = logging.FileHandler(JSON_LOG_PATH)
+_handler.setFormatter(JsonFormatter())
+logger.addHandler(_handler)
 
 
 class Agent:
@@ -121,6 +101,8 @@ class Agent:
         in_thinking = False
         in_content = False
         content = ""
+        text_buffer = ""
+        suppress_output = False
 
         for chunk in stream:
             msg = chunk.get("message") if isinstance(
@@ -145,83 +127,68 @@ class Agent:
                     self.emit("\n[Response]\n", end="")
                 if not in_content:
                     in_content = True
-                self.emit(chunk_content, end="")
+
+                text_buffer += chunk_content
                 content += chunk_content
+
+                # State machine to filter out <think> tags from the TUI stream
+                while text_buffer:
+                    if suppress_output:
+                        end_idx = text_buffer.find("</think>")
+                        if end_idx != -1:
+                            text_buffer = text_buffer[end_idx + 8:]
+                            suppress_output = False
+                        else:
+                            break
+                    else:
+                        start_idx = text_buffer.find("<think>")
+                        if start_idx != -1:
+                            if start_idx > 0:
+                                self.emit(text_buffer[:start_idx], end="")
+                            text_buffer = text_buffer[start_idx + 7:]
+                            suppress_output = True
+                        else:
+                            # Hold back the last 7 chars to avoid splitting a tag across chunks
+                            if len(text_buffer) > 7:
+                                emit_len = len(text_buffer) - 7
+                                self.emit(text_buffer[:emit_len], end="")
+                                text_buffer = text_buffer[emit_len:]
+                            else:
+                                break
+
+        if not suppress_output and text_buffer:
+            self.emit(text_buffer, end="")
 
         if in_thinking or in_content:
             self.emit(end)
 
+        # Final cleanup of any unclosed tags in the returned content
+        if content:
+            content = re.sub(r'<think>.*?</think>', '',
+                             content, flags=re.DOTALL).strip()
+            if '<think>' in content:
+                content = re.sub(r'<think>.*', '', content,
+                                 flags=re.DOTALL).strip()
+            if '</think>' in content:
+                content = re.sub(r'</think>', '', content).strip()
+
         return content
-
-    def generate_plan(self, user_prompt: str) -> str:
-        self.emit("-> [Pass 0] Synthesizing execution plan...")
-        with REGISTRY_LOCK:
-            active_tools = list(TOOL_REGISTRY.values())
-        tools_info = "\n".join(
-            [f"- {t.__name__}: {inspect.getdoc(t) or 'No description'}" for t in active_tools])
-        plan_messages = [
-            {"role": "system", "content": f"You are an expert planner. Create a concise step-by-step plan for the user's request. Identify what tools need to be created or used.\n\nCurrently available tools:\n{tools_info}"},
-            {"role": "user", "content": user_prompt}
-        ]
-        try:
-            stream = chat(model=META_PROMPT_MODEL,
-                          messages=plan_messages, stream=True)
-            plan = self._print_stream_and_get_content(
-                stream, header="[Plan]\n", end="\n\n")
-            return plan, tools_info
-        except Exception as e:
-            self.emit(f"   [Planning Failed]: {e}\n")
-            return "", tools_info
-
-    def generate_dynamic_system_prompt(self, goal: str, plan: str, tools_info: str) -> str:
-        self.emit("-> [Pass 1] Synthesizing task-specific System Prompt...")
-        cwd = os.getcwd()
-        try:
-            entries = os.listdir(cwd)
-            dirs = [d for d in entries if os.path.isdir(os.path.join(cwd, d))]
-            files = [f for f in entries if not os.path.isdir(
-                os.path.join(cwd, f))]
-            dir_context = f"Current Working Directory: {cwd}\nDirectories: {dirs}\nFiles: {files}"
-        except Exception:
-            dir_context = "Current Working Directory: Unknown"
-
-        meta_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert meta-prompt engineer for an autonomous Python agent. "
-                    "Analyze the user's core intent and goal, and write 3-5 concise, high-impact tactical directives. "
-                    "CRITICAL: Do NOT answer the user's prompt. Do NOT guess file contents. Do NOT hallucinate data. "
-                    "Only output the tactical directives the main agent must follow.\n\n"
-                    f"Environment Context:\n{dir_context}\n\n"
-                    f"Available Tools:\n{tools_info}\n\n"
-                    f"Execution Plan:\n{plan}"
-                ),
-            },
-            {"role": "user", "content": f"Target Goal:\n{goal}"},
-        ]
-        try:
-            stream = chat(model=META_PROMPT_MODEL,
-                          messages=meta_messages, stream=True)
-            dynamic_rules = self._print_stream_and_get_content(
-                stream, header="[Meta-Prompt Directives]\n", end="\n\n-> [Pass 1 Complete] Dynamic instructions generated.\n\n")
-            return dynamic_rules.strip()
-        except Exception as e:
-            self.emit(
-                f"\n-> [Pass 1 Fallback] Meta-prompt generation skipped: {e}\n\n")
-            return "Focus on safe, correct code execution and modular tool design."
 
     def generate_adversarial_test_cases(self, tool_name: str, python_code: str) -> list[dict]:
         self.emit(
             f"-> [Pass 1.5 - Adversarial Tester Agent] Generating edge-case verification tests for '{tool_name}'...\n")
+        context_messages = build_aspect_context(
+            self, "tester", tool_name, recent_n=0)
+
         tester_messages = [
             {"role": "system",
                 "content": "You are an Adversarial QA Testing Agent. Inspect the provided Python function signature. Return ONLY a raw JSON array of test case objects. Each object must have a 'name' and 'args' key. The 'args' keys MUST EXACTLY match the parameter names of the function. Generate 3 distinct test cases: happy path, empty input, and special characters/edge case. Use REAL, plausible values for file paths or inputs (e.g., 'README.md', '', '/tmp/nonexistent.txt'). Do NOT invent paths under /test/ that don't exist."},
+            *context_messages,  # Inject past test cases here!
             {"role": "user", "content": f"Target Function Code:\n{python_code}"},
         ]
         try:
-            stream = chat(model=TESTER_MODEL,
-                          messages=tester_messages, stream=True)
+            stream = chat(model=TESTER_MODEL, messages=tester_messages,
+                          stream=True, temperature=TESTER_TEMP)
             content_buffer = self._print_stream_and_get_content(
                 stream, header="[Adversarial Tester]\n", end="\n")
             cleaned = content_buffer.strip().replace(
@@ -229,8 +196,37 @@ class Agent:
             parsed_args = json.loads(cleaned)
             if isinstance(parsed_args, list):
                 self.emit(f"   [Adversarial Tests Generated]: {parsed_args}\n")
+                save_aspect_memory("tester", self.session_id, json.dumps(parsed_args), embedding=get_embedding(tool_name))
                 return parsed_args
         except Exception as e:
+            # Better JSON extraction with fallback
+            try:
+                # Try to find JSON array in response
+                match = re.search(r'\[[\s\S]*\]', content_buffer)
+                if match:
+                    parsed_args = json.loads(match.group())
+                    if isinstance(parsed_args, list) and parsed_args:
+                        # Validate each test case has required keys
+                        valid_cases = []
+                        for tc in parsed_args:
+                            if isinstance(tc, dict) and "args" in tc:
+                                valid_cases.append(tc)
+                        if valid_cases:
+                            return valid_cases
+            except (json.JSONDecodeError, Exception):
+                pass
+            # Fallback: extract function signature and generate basic tests
+            try:
+                tree = ast.parse(python_code)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        sig_params = {
+                            arg.arg: "" for arg in node.args.args
+                            if arg.arg != 'kwargs' and arg.arg != 'self'
+                        }
+                        return [{"name": "default", "args": sig_params}]
+            except Exception:
+                pass
             self.emit(
                 f"   [Adversarial Tester Warning]: Failed generating custom tests ({e}). Defaulting to standard empty args.\n")
         return [{"name": "default", "args": {}}]
@@ -249,14 +245,13 @@ class Agent:
     def ask_model_stream(self, messages: list, tools: list) -> Message:
         try:
             stream = chat(model=REASONING_MODEL, messages=messages,
-                          tools=tools, think=THINK_ENABLED, stream=True)
+                          tools=tools, think=THINK_ENABLED, stream=True, temperature=REASONING_TEMP)
         except urllib.error.HTTPError as e:
             if e.code == 400 and THINK_ENABLED:
-                # Retry without think — model may not support thinking mode
                 self.emit(
                     "   [Warning] Model rejected think=true. Retrying without thinking mode...\n")
                 stream = chat(model=REASONING_MODEL, messages=messages,
-                              tools=tools, think=False, stream=True)
+                              tools=tools, think=False, stream=True, temperature=REASONING_TEMP)
             else:
                 raise
 
@@ -265,6 +260,8 @@ class Agent:
         assembled_content = ""
         assembled_thinking = ""
         assembled_tool_calls = []
+        text_buffer = ""
+        suppress_output = False
 
         for chunk in stream:
             msg = chunk.get("message") if isinstance(
@@ -292,8 +289,33 @@ class Agent:
                     self.emit("\n[Response]\n", end="")
                 if not in_content:
                     in_content = True
-                self.emit(chunk_content, end="")
+
+                text_buffer += chunk_content
                 assembled_content += chunk_content
+
+                # State machine to filter out <think> tags from the TUI stream
+                while text_buffer:
+                    if suppress_output:
+                        end_idx = text_buffer.find("</think>")
+                        if end_idx != -1:
+                            text_buffer = text_buffer[end_idx + 8:]
+                            suppress_output = False
+                        else:
+                            break
+                    else:
+                        start_idx = text_buffer.find("<think>")
+                        if start_idx != -1:
+                            if start_idx > 0:
+                                self.emit(text_buffer[:start_idx], end="")
+                            text_buffer = text_buffer[start_idx + 7:]
+                            suppress_output = True
+                        else:
+                            if len(text_buffer) > 7:
+                                emit_len = len(text_buffer) - 7
+                                self.emit(text_buffer[:emit_len], end="")
+                                text_buffer = text_buffer[emit_len:]
+                            else:
+                                break
 
             if chunk_tools:
                 if in_thinking or in_content:
@@ -310,7 +332,24 @@ class Agent:
                         self.emit(
                             f"-> Model requested tool: '{func_name}' | Args: {func_args}\n")
 
+        if not suppress_output and text_buffer:
+            self.emit(text_buffer, end="")
+
         self.emit("\n")
+
+        # Final cleanup of any unclosed tags before saving to history
+        if assembled_content:
+            assembled_content = re.sub(
+                r'<think>.*?</think>', '', assembled_content, flags=re.DOTALL).strip()
+            if '<think>' in assembled_content:
+                assembled_content = re.sub(
+                    r'<think>.*', '', assembled_content, flags=re.DOTALL).strip()
+            if '</think>' in assembled_content:
+                assembled_content = re.sub(
+                    r'</think>', '', assembled_content).strip()
+            if not assembled_content:
+                assembled_content = None
+
         return Message(
             role="assistant", content=assembled_content,
             tool_calls=self.sanitize_tool_calls(
@@ -334,7 +373,7 @@ class Agent:
 
         if self.autonomous_mode and resolved_name == "edit_source_file":
             patch_id = str(uuid.uuid4())[:8]
-            patch_dir = "pending_patches"
+            patch_dir = PATCH_DIR  # <-- USE CONFIG PATH
             os.makedirs(patch_dir, exist_ok=True)
             patch_path = os.path.join(patch_dir, f"patch_{patch_id}.json")
 
@@ -371,9 +410,11 @@ class Agent:
         start_time = time.time()
         status = ResultStatus.SUCCESS
         try:
-            if resolved_name in META_TOOLS:
+            # --- KEY FIX: Builtin tools execute IN-PROCESS ---
+            if is_builtin_tool(resolved_name):
                 self.emit(
-                    f"-> Executing meta-tool in process: '{resolved_name}' [Trace: {trace_id}]...\n")
+                    f"-> [In-Process Execution] Tool: '{resolved_name}' [Trace: {trace_id}]...\n")
+
                 if resolved_name in ("create_tool", "update_tool"):
                     target_tool = args.get("tool_name", "dynamic_func")
                     code = args.get("python_code", "")
@@ -382,11 +423,13 @@ class Agent:
                     args["test_inputs"] = test_cases
 
                 result_str = tool_func(**args)
-                if "Successfully" in result_str:
+                if isinstance(result_str, str) and "Successfully" in result_str:
                     status = ResultStatus.SUCCESS
                 else:
                     status = ResultStatus.VALIDATION_FAILURE
                 return ToolResult(status, result_str)
+
+            # --- Custom tools still go through sandbox ---
             else:
                 self.emit(
                     f"-> [Sandbox Execution] Tool: '{resolved_name}' [Trace: {trace_id}]...\n")
@@ -410,10 +453,14 @@ class Agent:
             resolved_name, _ = self.resolve_tool_function(
                 self._get_call_details(current_call)[0])
 
-            is_dynamic_tool = resolved_name not in META_TOOLS
+            # --- KEY FIX: Don't try to heal builtin tools ---
+            is_dynamic_tool = (resolved_name not in META_TOOLS
+                               and not is_builtin_tool(resolved_name))
 
             if not is_dynamic_tool or result.is_success or result.status == ResultStatus.NOT_FOUND or heal_attempts >= max_heals:
                 return resolved_name, result
+
+            # ... rest of self-heal logic for custom tools only ...
 
             heal_attempts += 1
             self.emit(
@@ -422,21 +469,25 @@ class Agent:
 
             try:
                 tool_path = os.path.join(
-                    dynamic_tools.CUSTOM_TOOLS_DIR, f"{resolved_name}.py")
+                    CUSTOM_TOOLS_DIR, f"{resolved_name}.py")
                 with open(tool_path, 'r', encoding='utf-8') as f:
                     broken_code = f.read()
             except Exception:
                 return resolved_name, result
 
+            # Inside execute_single_tool_call, right before calling the LLM to heal:
+            raw_func_name, args = self._get_call_details(current_call)
+
             heal_messages = [
-                {"role": "system", "content": "You are an autonomous debugging agent. A tool just crashed. Analyze the traceback and the code. Return ONLY the complete, fixed Python code for the function. Do not include explanations."},
-                {"role": "user", "content": f"Tool Name: {resolved_name}\n\nTraceback/Error:\n{result.value}\n\nBroken Code:\n{broken_code}"}
+                {"role": "system", "content": "You are an autonomous debugging agent. A tool just crashed. Analyze the traceback, the code, and the EXACT arguments that caused the crash. Return ONLY the complete, fixed Python code for the function. Do not include explanations."},
+                {"role": "user",
+                    "content": f"Tool Name: {resolved_name}\n\nArguments that caused the crash:\n{json.dumps(args, default=str)}\n\nTraceback/Error:\n{result.value}\n\nBroken Code:\n{broken_code}"}
             ]
 
             try:
                 self.emit("   [Self-Heal] Generating fixed code:\n", end="")
-                stream = chat(model=META_PROMPT_MODEL,
-                              messages=heal_messages, stream=True)
+                stream = chat(model=META_PROMPT_MODEL, messages=heal_messages,
+                              stream=True, temperature=META_PROMPT_TEMP)
                 fixed_code = self._print_stream_and_get_content(
                     stream, header="", end="\n")
                 fixed_code = fixed_code.replace(
@@ -450,7 +501,11 @@ class Agent:
                 return resolved_name, result
 
             heal_call = {"function": {"name": "update_tool", "arguments": {
-                "tool_name": resolved_name, "python_code": fixed_code}}}
+                "tool_name": resolved_name,
+                "python_code": fixed_code,
+                # Force the sandbox to test the exact args that caused the crash!
+                "test_inputs": [{"name": "crash_case", "args": args}]
+            }}}
             heal_result = self._execute_once(heal_call, trace_id)
 
             if heal_result.is_success:
@@ -463,71 +518,30 @@ class Agent:
                 result.value += f"\n\n[Self-Heal Attempt Failed]: {heal_result.value}"
                 return resolved_name, result
 
-    def _extract_json_from_text(self, text: str) -> dict | None:
-        match = re.search(r"```json\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
-        if match:
-            text = match.group(1)
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            json_str = text[start:end+1]
-            try:
-                return json.loads(json_str)
-            except json.JSONDecodeError:
-                return None
-        return None
-
-    def reflect_on_task(self, user_prompt: str, messages: list):
-        self.emit("\n-> [Post-Mortem] Reflecting on task execution...\n")
-        reflect_messages = [
-            {"role": "system",
-                "content": "You are a reflection agent. Analyze the conversation. Did the tools work? Were any redundant? What should be remembered for future tasks? Output a JSON with 'learnings' (list of strings) and 'improvements' (string)."},
-            {"role": "user",
-                "content": f"Original Prompt: {user_prompt}\n\nConversation:\n{json.dumps(messages[-10:], default=str)}"}
-        ]
-        try:
-            stream = chat(model=META_PROMPT_MODEL,
-                          messages=reflect_messages, stream=True)
-            content_buffer = self._print_stream_and_get_content(
-                stream, header="[Reflection]\n", end="\n")
-
-            if not content_buffer.strip():
-                self.emit(
-                    "   [Reflection Skipped]: Model returned an empty response.\n")
-                return
-
-            data = self._extract_json_from_text(content_buffer)
-            if not data:
-                self.emit(
-                    "   [Reflection Failed]: Could not extract valid JSON from model output.\n")
-                return
-
-            for learning in data.get("learnings", []):
-                emb = get_embedding(learning)
-                save_learning(learning, embedding=emb)
-
-            improvements = data.get("improvements", "")
-            if improvements:
-                with open("improvement_guide.md", "a", encoding="utf-8") as f:
-                    f.write(f"\n## Task: {user_prompt}\n{improvements}\n")
-
-            self.emit("   [Reflection Complete]: Learnings saved.\n")
-        except Exception as e:
-            self.emit(f"   [Reflection Failed]: {e}\n")
-
     def run_agent_loop(self, user_prompt: str, plan: str, tools_info: str, learnings: list = None) -> None:
         self.emit(
             f"\n=== User Turn: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
         self.emit(f"User > {user_prompt}\n\n")
 
-        dynamic_instructions = self.generate_dynamic_system_prompt(
-            user_prompt, plan, tools_info)
+        dynamic_instructions = generate_dynamic_system_prompt(
+            self, user_prompt, plan, tools_info)
         plan_str = f"\n\nExecution Plan:\n{plan}" if plan else ""
-        learnings_str = f"\n\nRelevant Past Learnings:\n{learnings}" if learnings else ""
+
+        learnings_str = ""
+        if learnings:
+            learnings_str = "\n\nRelevant Past Learnings:\n" + \
+                "\n".join(f"- {l}" for l in learnings)
+
+        # Fetch accumulated summaries
+        summaries = retrieve_summaries(self.session_id)
+        summaries_str = ""
+        if summaries:
+            summaries_str = "\n\nAccumulated Progress Summaries:\n" + \
+                "\n".join(f"- {s}" for s in summaries)
 
         combined_system_prompt = {
             "role": "system",
-            "content": f"{BASE_SYSTEM_PROMPT}\n\nTask Specific Directives:\n{dynamic_instructions}{plan_str}{learnings_str}",
+            "content": f"{BASE_SYSTEM_PROMPT}{summaries_str}{learnings_str}\n\nTask Specific Directives:\n{dynamic_instructions}{plan_str}",
         }
 
         if not self.history:
@@ -546,14 +560,131 @@ class Agent:
         while iteration < MAX_AGENT_ITERATIONS:
             iteration += 1
 
-            self.history = condense_history(
+            # Memory Condensation
+            recent_history, summary = condense_history(
                 self.history, model_name=SUMMARY_MODEL, log_stream_func=self.on_stream)
+
+            if summary:
+                save_summary(self.session_id, summary)
+                # Update system prompt to include the newly saved summary
+                summaries_str += f"\n- {summary}"
+                combined_system_prompt["content"] = f"{BASE_SYSTEM_PROMPT}{summaries_str}{learnings_str}\n\nTask Specific Directives:\n{dynamic_instructions}{plan_str}"
+
+                if recent_history and recent_history[0].get("role") == "system":
+                    recent_history[0] = combined_system_prompt
+                else:
+                    recent_history.insert(0, combined_system_prompt)
+
+                self.history = recent_history
+
             active_tools = get_relevant_tools(user_prompt, top_k=5)
             assistant_message = self.ask_model_stream(
                 self.history, active_tools)
 
+            # --- KEY FIX: Robust Fallback Parser for local models ---
+            if not assistant_message.tool_calls and assistant_message.content:
+                content = assistant_message.content
+                # Strip <think> tags if the model outputted them as text
+                clean_content = re.sub(
+                    r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
+                tool_name = None
+                tool_args = {}
+
+                # 1. Try to find a standard JSON tool call (e.g., {"name": "tool", "arguments": {}})
+                match = re.search(
+                    r'\{[\s\S]*?"name"[\s\S]*?"arguments"[\s\S]*?\}', clean_content)
+                if match:
+                    try:
+                        parsed = json.loads(match.group(0))
+                        if "name" in parsed:
+                            tool_name = parsed["name"]
+                            tool_args = parsed.get("arguments", {})
+                            if isinstance(tool_args, str):
+                                tool_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        pass
+
+                # 2. Try to find a generic JSON tool call (e.g., {"tool": "list_directory", "args": {}})
+                if not tool_name:
+                    match = re.search(
+                        r'\{[\s\S]*?"tool"[\s\S]*?\}', clean_content)
+                    if match:
+                        try:
+                            parsed = json.loads(match.group(0))
+                            if "tool" in parsed:
+                                tool_name = parsed["tool"]
+                                tool_args = parsed.get("args", {})
+                        except json.JSONDecodeError:
+                            pass
+
+                # 3. Try to parse XML-like function calls (e.g., <function=tool_name>...<parameter=key>value</parameter>...</function>)
+                if not tool_name:
+                    match = re.search(
+                        r'<(?:function|tool)=([a-zA-Z0-9_]+)>([\s\S]*?)</(?:function|tool)>', clean_content)
+                    if match:
+                        tool_name = match.group(1)
+                        params_block = match.group(2)
+                        # Extract parameters: <parameter=name>value</parameter> or <param=name>value</param>
+                        param_matches = re.findall(
+                            r'<(?:parameter|param)=([a-zA-Z0-9_]+)>([\s\S]*?)</(?:parameter|param)>', params_block)
+                        for p_name, p_value in param_matches:
+                            tool_args[p_name] = p_value.strip()
+
+                # 4. Try to parse simple open tags (e.g., <list_directory>)
+                if not tool_name:
+                    # Find all potential XML tags
+                    tags = re.findall(r'<([a-zA-Z0-9_]+)>', clean_content)
+                    for tag in tags:
+                        # Check if this tag is actually a registered tool
+                        with REGISTRY_LOCK:
+                            if tag in TOOL_REGISTRY:
+                                tool_name = tag
+                                break
+
+                # 5. Try to parse Python code blocks (e.g., ```python\ntool_name(args)\n```)
+                if not tool_name:
+                    match = re.search(
+                        r'```(?:python)?\s*([\s\S]*?)\s*```', clean_content)
+                    code_to_parse = match.group(1) if match else clean_content
+                    try:
+                        tree = ast.parse(code_to_parse)
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                                func = node.value.func
+                                if isinstance(func, ast.Name):
+                                    tool_name = func.id
+                                    for kw in node.value.keywords:
+                                        try:
+                                            tool_args[kw.arg] = ast.literal_eval(
+                                                kw.value)
+                                        except:
+                                            tool_args[kw.arg] = ""
+                                    break
+                    except SyntaxError:
+                        pass
+                    except Exception:
+                        pass
+
+                # If we found a tool, construct the tool_call object
+                if tool_name:
+                    self.emit(
+                        f"   [Fallback Parser] Detected tool call '{tool_name}' in text response.\n")
+                    assistant_message.tool_calls = [{
+                        "id": "fallback_call",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": tool_args
+                        }
+                    }]
+                    # Clear the text content so it doesn't confuse the history
+                    assistant_message.content = None
+            # ----------------------------------------------------------------
+
             msg_dict = {"role": assistant_message.role,
                         "content": assistant_message.content or ""}
+
             if assistant_message.tool_calls:
                 msg_dict["tool_calls"] = assistant_message.tool_calls
             if hasattr(assistant_message, "thinking") and assistant_message.thinking:
@@ -621,26 +752,50 @@ class Agent:
                 self.history.append(
                     {"role": "tool", "name": tool_name, "content": result.value})
 
+            failure_streak = {}
+            for tool_name, result in results:
+                if not result.is_success:
+                    failure_streak[tool_name] = failure_streak.get(
+                        tool_name, 0) + 1
+                    if failure_streak[tool_name] >= 2:
+                        self.emit(
+                            f"\n[Safety] Tool '{tool_name}' failed {failure_streak[tool_name]} times. Forcing strategy change.\n")
+                        self.history.append({
+                            "role": "user",
+                            "content": f"Tool '{tool_name}' has failed {failure_streak[tool_name]} consecutive times. Stop calling it. Try a different approach or explain to the user why the operation cannot be completed."
+                        })
+                else:
+                    failure_streak[tool_name] = 0
+
+            if iteration > 5 and not any(r.is_success for _, r in results):
+                self.history.append({
+                    "role": "user",
+                    "content": "CRITICAL: Multiple tool calls have failed in recent iterations. Consider: (1) Check if you're calling a builtin tool that already exists, (2) Verify your arguments match the tool's expected parameters, (3) If truly stuck, explain the situation to the user instead of looping."
+                })
+
             self.turn_count += 1
             save_checkpoint(self.session_id, self.turn_count, self.history)
         else:
             self.emit(
                 f"[Safety] Reached max iterations ({MAX_AGENT_ITERATIONS}). Forcing stop.\n")
             self.history.append(
-                {"role": "system", "content": "Forced stop: iteration budget exhausted."})
+                {"role": "user", "content": "Forced stop: iteration budget exhausted."})
 
     def _is_goal_satisfied(self, goal_text: str) -> bool:
+        summaries = retrieve_summaries(self.session_id)
+        summaries_str = "\n".join(f"- {s}" for s in summaries) if summaries else "None"
+
         verification = [
-            {"role": "system", "content": "You verify whether a stated goal has been accomplished based on the recent agent conversation. Return JSON: {\"satisfied\": true|false, \"reason\": \"...\"}."},
+            {"role": "system", "content": "You verify whether a stated goal has been accomplished based on the recent agent conversation AND the progress summaries. Return JSON: {\"satisfied\": true|false, \"reason\": \"...\"}."},
             {"role": "user",
-                "content": f"Goal: {goal_text}\n\nRecent conversation:\n{json.dumps(self.history[-8:], default=str)}"}
+                "content": f"Goal: {goal_text}\n\nProgress Summaries:\n{summaries_str}\n\nRecent conversation (last 8 turns):\n{json.dumps(self.history[-8:], default=str)}"}
         ]
         try:
-            stream = chat(model=META_PROMPT_MODEL,
-                          messages=verification, stream=True)
+            stream = chat(model=META_PROMPT_MODEL, messages=verification,
+                          stream=True, temperature=META_PROMPT_TEMP)
             buf = self._print_stream_and_get_content(
                 stream, header="[Goal Verification]\n", end="\n")
-            data = self._extract_json_from_text(buf)
+            data = _extract_json_from_text(buf)
             if data:
                 return bool(data.get("satisfied", False))
         except Exception:
@@ -648,8 +803,8 @@ class Agent:
         return False
 
     def run_autonomous_cycle(self, allow_self_edit: bool = False) -> bool:
-        from goals import select_autonomous_task
-        from storage import mark_goal_attempted, mark_goal_completed, mark_goal_blocked, log_system_improvement
+        from src.agent.autonomous import select_autonomous_task
+        from src.memory.storage import mark_goal_attempted, mark_goal_completed, mark_goal_blocked, log_system_improvement
 
         self.autonomous_mode = True
         self.emit(
@@ -660,7 +815,7 @@ class Agent:
         state_emb = get_embedding(state_text)
 
         task = select_autonomous_task(
-            allow_self_edit=allow_self_edit, current_state_emb=state_emb)
+            allow_self_edit=allow_self_edit, current_state_emb=state_emb, agent=self)
 
         if task["type"] == "none":
             self.emit(
@@ -677,11 +832,12 @@ class Agent:
 
             prompt = f"[Autonomous Task — Long-Term Goal #{gid}]\n{gtext}"
             try:
-                plan, tools_info = self.generate_plan(prompt)
+                plan, tools_info = generate_plan(
+                    agent=self, user_prompt=prompt)
                 learnings = retrieve_learnings(
                     gtext, query_emb=get_embedding(gtext))
                 self.run_agent_loop(prompt, plan, tools_info, learnings)
-                self.reflect_on_task(prompt, self.history)
+                reflect_on_task(self, prompt, self.history, plan)
 
                 if self._is_goal_satisfied(gtext):
                     mark_goal_completed(
@@ -716,11 +872,11 @@ class Agent:
                 f"region back to confirm the change is correct."
             )
             try:
-                plan, tools_info = self.generate_plan(prompt)
+                plan, tools_info = generate_plan(agent=self, user_prompt=prompt)
                 learnings = retrieve_learnings(
                     f"improve {fpath}", query_emb=get_embedding(f"improve {fpath}"))
                 self.run_agent_loop(prompt, plan, tools_info, learnings)
-                self.reflect_on_task(prompt, self.history)
+                reflect_on_task(self, prompt, self.history, plan)
                 log_system_improvement(fpath, issue, "applied")
                 self.autonomous_mode = False
                 return True
@@ -743,271 +899,3 @@ class Agent:
             self.emit(
                 f"=== Session '{self.session_id}' not found. Starting fresh session. ===\n")
             self.session_id = str(uuid.uuid4())[:8]
-
-
-IDLE_TIMEOUT_SECONDS = 240
-AUTONOMOUS_COOLDOWN_SECONDS = 120
-MAX_AUTONOMOUS_CYCLES_IN_A_ROW = 12
-
-
-def handle_special_commands(agent: "Agent", user_input: str) -> bool:
-    from goals import list_long_term_goals, extract_goals_from_conversation
-    from storage import add_long_term_goal, mark_goal_completed
-
-    lowered = user_input.lower().strip()
-
-    if lowered.startswith("goal:"):
-        text = user_input[5:].strip()
-        if text:
-            gid = add_long_term_goal(text, priority=5, source="user")
-            agent.emit(f"   [Goal Saved] #{gid}: {text}\n")
-        return True
-
-    if lowered.startswith("priority goal:"):
-        text = user_input[len("priority goal:"):].strip()
-        if text:
-            gid = add_long_term_goal(text, priority=9, source="user")
-            agent.emit(f"   [Priority Goal Saved] #{gid}: {text}\n")
-        return True
-
-    if lowered in ("goals", "list goals"):
-        goals = list_long_term_goals()
-        agent.emit(f"\n=== Long-Term Goals ({len(goals)}) ===\n")
-        for g in goals:
-            agent.emit(
-                f"  [#{g['id']}] [{g['status']}] P:{g['priority']} attempts:{g['attempts']} — {g['goal_text']}\n")
-        agent.emit("\n")
-        return True
-
-    if lowered.startswith("complete goal"):
-        try:
-            gid = int(lowered.split()[-1])
-            mark_goal_completed(gid, "Marked complete by user")
-            agent.emit(f"   [Goal #{gid} marked complete]\n")
-        except (ValueError, IndexError):
-            agent.emit("   Usage: complete goal <id>\n")
-        return True
-
-    if lowered == "list patches":
-        patch_dir = "pending_patches"
-        if os.path.exists(patch_dir):
-            patches = [f for f in os.listdir(patch_dir) if f.endswith(".json")]
-            agent.emit(f"\n=== Pending Patches ({len(patches)}) ===\n")
-            for p in patches:
-                agent.emit(f"  - {p}\n")
-            agent.emit("Use: approve patch <filename>\n\n")
-        else:
-            agent.emit("No pending patches.\n")
-        return True
-
-    if lowered.startswith("approve patch"):
-        try:
-            patch_file = lowered.split(" ", 2)[2]
-            patch_path = os.path.join("pending_patches", patch_file)
-            if not os.path.exists(patch_path):
-                agent.emit(f"   Error: Patch file '{patch_file}' not found.\n")
-                return True
-
-            with open(patch_path, "r", encoding="utf-8") as f:
-                patch_data = json.load(f)
-
-            agent.emit(f"   [Applying Patch] {patch_file}...\n")
-            agent.autonomous_mode = False
-            call = {"function": {"name": "edit_source_file",
-                                 "arguments": patch_data["args"]}}
-            res = agent._execute_once(call, patch_data["trace_id"])
-
-            if res.is_success:
-                os.remove(patch_path)
-                agent.emit(f"   [Patch Applied & Removed]: {res.value}\n")
-            else:
-                agent.emit(f"   [Patch Failed]: {res.value}\n")
-        except Exception as e:
-            agent.emit(f"   [Approve Patch Error]: {e}\n")
-        return True
-
-    return False
-
-
-def run_blocking_loop(agent: "Agent", use_tui: bool = False) -> None:
-    tui = None
-    if use_tui:
-        import tui as tui_module
-        tui = tui_module.CursesTUI()
-        agent.on_stream = tui.stream_handler
-        agent.on_input = tui.input_handler
-        sys.stdout = tui_module.StdoutRedirector(tui)
-
-    try:
-        while True:
-            try:
-                if tui:
-                    user_input = tui.get_input_async(3600)
-                    if user_input is None:
-                        continue
-                    user_input = user_input.strip()
-                else:
-                    user_input = input("User > ").strip()
-
-                if not user_input:
-                    continue
-                if user_input.lower() in ("exit", "quit"):
-                    break
-                if handle_special_commands(agent, user_input):
-                    continue
-
-                plan, tools_info = agent.generate_plan(user_input)
-                learnings = retrieve_learnings(
-                    user_input, query_emb=get_embedding(user_input))
-                agent.run_agent_loop(user_input, plan, tools_info, learnings)
-                agent.reflect_on_task(user_input, agent.history)
-            except (KeyboardInterrupt, SystemExit):
-                agent.emit("\nExiting...\n")
-                sys.exit(0)
-    finally:
-        if tui:
-            sys.stdout = sys.__stdout__
-            tui.cleanup()
-
-
-def run_scheduled_loop(agent: "Agent", idle_timeout: int, allow_self_edit: bool, use_tui: bool = False) -> None:
-    from async_input import AsyncInputReader
-    from goals import extract_goals_from_conversation, list_long_term_goals
-
-    tui = None
-    if use_tui:
-        import tui as tui_module
-        tui = tui_module.CursesTUI()
-        agent.on_stream = tui.stream_handler
-        agent.on_input = tui.input_handler
-        sys.stdout = tui_module.StdoutRedirector(tui)
-
-    try:
-        reader = None
-        if not tui:
-            reader = AsyncInputReader()
-
-        consecutive_autonomous = 0
-
-        agent.emit(
-            f"Autonomous Mode: ENABLED  (idle timeout: {idle_timeout}s, self-edit: {'ON' if allow_self_edit else 'OFF'})\n")
-
-        pending = list_long_term_goals(status="pending")
-        if pending:
-            agent.emit(f"Pending long-term goals: {len(pending)}\n")
-            for g in pending[:3]:
-                agent.emit(f"  [#{g['id']}] {g['goal_text']}\n")
-        agent.emit("\n")
-
-        while True:
-            try:
-                if tui:
-                    user_input = tui.get_input_async(idle_timeout)
-                    if user_input is not None:
-                        user_input = user_input.strip()
-                else:
-                    agent.emit("User > ", end="")
-                    sys.stdout.flush()
-                    user_input = reader.get_input(timeout=idle_timeout)
-
-                if user_input is None:
-                    consecutive_autonomous += 1
-                    if consecutive_autonomous > MAX_AUTONOMOUS_CYCLES_IN_A_ROW:
-                        agent.emit(
-                            f"\n[Safety] Hit {MAX_AUTONOMOUS_CYCLES_IN_A_ROW} consecutive autonomous cycles. Pausing for user.\n")
-                        consecutive_autonomous = 0
-                        continue
-                    agent.run_autonomous_cycle(allow_self_edit=allow_self_edit)
-                    time.sleep(AUTONOMOUS_COOLDOWN_SECONDS)
-                    continue
-
-                consecutive_autonomous = 0
-                agent.emit("\n")
-                if not user_input:
-                    continue
-                if user_input.lower() in ("exit", "quit"):
-                    break
-                if handle_special_commands(agent, user_input):
-                    continue
-
-                plan, tools_info = agent.generate_plan(user_input)
-                learnings = retrieve_learnings(
-                    user_input, query_emb=get_embedding(user_input))
-                agent.run_agent_loop(user_input, plan, tools_info, learnings)
-                agent.reflect_on_task(user_input, agent.history)
-
-                try:
-                    new_goals = extract_goals_from_conversation(
-                        user_input, agent.history)
-                    for g in new_goals:
-                        gid = add_long_term_goal(
-                            g, priority=5, source="reflection", embedding=get_embedding(g))
-                        agent.emit(
-                            f"   [Goal Captured from conversation] #{gid}: {g}\n")
-                except Exception:
-                    pass
-
-            except (KeyboardInterrupt, SystemExit):
-                agent.emit("\nExiting...\n")
-                sys.exit(0)
-    finally:
-        if tui:
-            sys.stdout = sys.__stdout__
-            tui.cleanup()
-
-
-def main():
-    signal.signal(signal.SIGINT, lambda s, f: (sys.stderr.write(
-        "\n[Interrupt] Force shutting down...\n"), sys.exit(0)))
-    init_db()
-
-    parser = argparse.ArgumentParser(description="Ollama Dynamic Tool Agent")
-    parser.add_argument("--session", type=str, help="Session ID to resume")
-    parser.add_argument("--list-sessions", action="store_true")
-    parser.add_argument("--yolo", action="store_true",
-                        help="Skip HITL approval")
-    parser.add_argument("--no-autonomous", action="store_true",
-                        help="Disable scheduler; block on input (legacy behavior)")
-    parser.add_argument("--idle-timeout", type=int, default=IDLE_TIMEOUT_SECONDS,
-                        help=f"Seconds to wait for input before autonomous wake-up (default: {IDLE_TIMEOUT_SECONDS})")
-    parser.add_argument("--autonomous-self-edit", action="store_true",
-                        help="DANGER: allow autonomous cycles to edit source files without approval. Without this flag, only long-term goals are pursued autonomously.")
-    parser.add_argument("--tui", action="store_true",
-                        help="Enable Text User Interface (curses)")
-    args = parser.parse_args()
-
-    if args.list_sessions:
-        sessions = list_sessions()
-        print("\n=== Saved Agent Sessions ===")
-        if not sessions:
-            print("No saved sessions found.")
-        else:
-            for s in sessions:
-                print(
-                    f"ID: {s['session_id']} | Turns: {s['latest_turn']} | Last Active: {s['timestamp']}")
-        sys.exit(0)
-
-    agent = Agent(session_id=args.session or str(
-        uuid.uuid4())[:8], yolo_mode=args.yolo)
-
-    if args.session:
-        agent.load_state()
-    else:
-        agent.emit(
-            f"=== Ollama Dynamic Agent Ready | Session: {agent.session_id} ===\n")
-
-    agent.emit(
-        f"Reasoning: '{REASONING_MODEL}' | Meta: '{META_PROMPT_MODEL}' | Tester: '{TESTER_MODEL}'\n")
-    with REGISTRY_LOCK:
-        agent.emit(f"Active Tools: {list(TOOL_REGISTRY.keys())}\n")
-    agent.emit(f"LLM Backend: {'Ollama' if is_ollama() else 'llama.cpp'}\n")
-
-    if args.no_autonomous:
-        run_blocking_loop(agent, use_tui=args.tui)
-    else:
-        run_scheduled_loop(agent, idle_timeout=args.idle_timeout,
-                           allow_self_edit=args.autonomous_self_edit, use_tui=args.tui)
-
-
-if __name__ == "__main__":
-    main()

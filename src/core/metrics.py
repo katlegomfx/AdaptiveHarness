@@ -1,4 +1,3 @@
-# observability/metrics.py
 from collections import defaultdict
 import time
 

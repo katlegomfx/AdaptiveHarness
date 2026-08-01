@@ -1,31 +1,36 @@
-# goals.py
+# src/agent/autonomous.py
 import json
 import os
 import re
 from typing import Dict, List, Optional
 
-from llm_backend import chat, get_embedding, cosine_similarity
-from observability.logger import logger
-from storage import (
+from src.llm_backend import chat, get_embedding, cosine_similarity
+from src.core.logger import logger
+from src.memory.storage import (
     add_long_term_goal, get_next_long_term_goal, list_long_term_goals,
     log_system_improvement, mark_goal_decomposed, update_goal_embedding
 )
+from src.config import BASE_DIR, GOAL_TEMP
 
 GOAL_MODEL = "ornith"
 
 INTROSPECTABLE_FILES = [
-    "main.py", "dynamic_tools.py", "memory.py", "llm_backend.py",
-    "sandbox.py", "storage.py", "safety_net.py",
-    "runtime/result.py", "observability/logger.py", "observability/metrics.py",
+    "start.py", "src/config.py", "src/safety_net.py",
+    "src/agent/agent.py", "src/agent/planner.py", "src/agent/parser.py", "src/agent/prompts.py", "src/agent/autonomous.py",
+    "src/core/result.py", "src/core/types.py", "src/core/logger.py", "src/core/metrics.py",
+    "src/llm_backend/base.py", "src/llm_backend/ollama.py", "src/llm_backend/llamacpp.py", "src/llm_backend/embeddings.py",
+    "src/tools/registry.py", "src/tools/builtin.py", "src/tools/dynamic.py", "src/tools/sandbox.py",
+    "src/memory/storage.py", "src/memory/condenser.py", "src/memory/reflection.py",
+    "src/ui/cli.py", "src/ui/tui.py", "src/ui/async_input.py"
 ]
 
 
-def extract_goals_from_conversation(user_prompt: str, conversation: list) -> List[str]:
+def extract_goals_from_conversation(user_prompt: str, conversation: list, agent=None) -> List[str]:
     messages = [
         {
             "role": "system",
             "content": (
-                "You extract LONG-TERM goals from agent conversations. "
+                "You extract LONG-TERM goals from src.agent conversations. "
                 "A long-term goal is something the user wants accomplished eventually but "
                 "not necessarily right now (e.g. 'we should eventually support X', "
                 "'I want the agent to be able to Y'). "
@@ -42,26 +47,46 @@ def extract_goals_from_conversation(user_prompt: str, conversation: list) -> Lis
         },
     ]
     try:
-        buf = ""
-        for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True):
-            msg = chunk.get("message") if isinstance(
-                chunk, dict) else getattr(chunk, "message", None)
-            if not msg:
-                continue
-            c = getattr(msg, "content", None) or (
-                msg.get("content") if isinstance(msg, dict) else None)
-            if c:
-                buf += c
+        if agent:
+            stream = chat(model=GOAL_MODEL, messages=messages,
+                          stream=True, temperature=GOAL_TEMP)
+            buf = agent._print_stream_and_get_content(
+                stream, header="[Goal Extractor]\n", end="\n"
+            )
+        else:
+            buf = ""
+            for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True, temperature=GOAL_TEMP):
+                msg = chunk.get("message") if isinstance(
+                    chunk, dict) else getattr(chunk, "message", None)
+                if not msg:
+                    continue
+                c = getattr(msg, "content", None) or (
+                    msg.get("content") if isinstance(msg, dict) else None)
+                if c:
+                    buf += c
+
         cleaned = buf.strip().replace("```json", "").replace("```", "").strip()
+
+        # Find the JSON array directly to avoid <think> tag deletion issues
+        start = cleaned.find('[')
+        end = cleaned.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start:end+1]
+        else:
+            return []  # No array found
+
         goals = json.loads(cleaned)
         if isinstance(goals, list):
             return [g.strip() for g in goals if isinstance(g, str) and g.strip()]
     except Exception as e:
-        logger.warning(f"Goal extraction failed: {e}")
+        if agent:
+            agent.emit(f"   [Goal Extraction Failed]: {e}\n")
+        else:
+            logger.warning(f"Goal extraction failed: {e}")
     return []
 
 
-def decompose_goal(goal_text: str) -> List[str]:
+def decompose_goal(goal_text: str, agent=None) -> List[str]:
     """Ask the LLM to split a large goal into 2-4 smaller, actionable sub-tasks."""
     messages = [
         {
@@ -75,31 +100,43 @@ def decompose_goal(goal_text: str) -> List[str]:
         {"role": "user", "content": f"Large Goal: {goal_text}"},
     ]
     try:
-        buf = ""
-        for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True):
-            msg = chunk.get("message") if isinstance(
-                chunk, dict) else getattr(chunk, "message", None)
-            if not msg:
-                continue
-            c = getattr(msg, "content", None) or (
-                msg.get("content") if isinstance(msg, dict) else None)
-            if c:
-                buf += c
+        if agent:
+            stream = chat(model=GOAL_MODEL, messages=messages,
+                          stream=True, temperature=GOAL_TEMP)
+            buf = agent._print_stream_and_get_content(
+                stream, header="[Goal Decomposer]\n", end="\n"
+            )
+        else:
+            buf = ""
+            for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True, temperature=GOAL_TEMP):
+                msg = chunk.get("message") if isinstance(
+                    chunk, dict) else getattr(chunk, "message", None)
+                if not msg:
+                    continue
+                c = getattr(msg, "content", None) or (
+                    msg.get("content") if isinstance(msg, dict) else None)
+                if c:
+                    buf += c
+
         cleaned = buf.strip().replace("```json", "").replace("```", "").strip()
         sub_tasks = json.loads(cleaned)
         if isinstance(sub_tasks, list) and sub_tasks:
             return [s.strip() for s in sub_tasks if isinstance(s, str) and s.strip()]
     except Exception as e:
-        logger.warning(f"Goal decomposition failed: {e}")
+        if agent:
+            agent.emit(f"   [Goal Decomposition Failed]: {e}\n")
+        else:
+            logger.warning(f"Goal decomposition failed: {e}")
     return []
 
 
-def find_system_improvement_opportunity() -> Optional[Dict]:
+def find_system_improvement_opportunity(agent=None) -> Optional[Dict]:
     file_contents: Dict[str, str] = {}
     for f in INTROSPECTABLE_FILES:
-        if os.path.exists(f):
+        abs_f = os.path.join(BASE_DIR, f)
+        if os.path.exists(abs_f):
             try:
-                with open(f, "r", encoding="utf-8") as fp:
+                with open(abs_f, "r", encoding="utf-8") as fp:
                     file_contents[f] = fp.read()
             except Exception:
                 pass
@@ -131,26 +168,36 @@ def find_system_improvement_opportunity() -> Optional[Dict]:
             "content": f"Source files (truncated):\n{src_dump}\n\nPre-identified markers:\n{marker_block}"},
     ]
     try:
-        buf = ""
-        for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True):
-            msg = chunk.get("message") if isinstance(
-                chunk, dict) else getattr(chunk, "message", None)
-            if not msg:
-                continue
-            c = getattr(msg, "content", None) or (
-                msg.get("content") if isinstance(msg, dict) else None)
-            if c:
-                buf += c
+        if agent:
+            stream = chat(model=GOAL_MODEL, messages=messages,
+                          stream=True, temperature=GOAL_TEMP)
+            buf = agent._print_stream_and_get_content(
+                stream, header="[Self-Improvement Analyzer]\n", end="\n"
+            )
+        else:
+            buf = ""
+            for chunk in chat(model=GOAL_MODEL, messages=messages, stream=True, temperature=GOAL_TEMP):
+                msg = chunk.get("message") if isinstance(
+                    chunk, dict) else getattr(chunk, "message", None)
+                if not msg:
+                    continue
+                c = getattr(msg, "content", None) or (
+                    msg.get("content") if isinstance(msg, dict) else None)
+                if c:
+                    buf += c
         cleaned = buf.strip().replace("```json", "").replace("```", "").strip()
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start != -1 and end != -1 and end > start:
             return json.loads(cleaned[start:end + 1])
     except Exception as e:
-        logger.warning(f"Self-improvement scan failed: {e}")
+        if agent:
+            agent.emit(f"   [Self-Improvement Scan Failed]: {e}\n")
+        else:
+            logger.warning(f"Self-improvement scan failed: {e}")
     return None
 
 
-def select_autonomous_task(allow_self_edit: bool = False, current_state_emb: list = None) -> Dict:
+def select_autonomous_task(allow_self_edit: bool = False, current_state_emb: list = None, agent=None) -> Dict:
     """Return one of:
          {"type": "long_term_goal",   "goal": {...}}
          {"type": "system_improvement","improvement": {...}}
@@ -159,7 +206,7 @@ def select_autonomous_task(allow_self_edit: bool = False, current_state_emb: lis
     goals = list_long_term_goals(status="pending")
     if not goals:
         if allow_self_edit:
-            imp = find_system_improvement_opportunity()
+            imp = find_system_improvement_opportunity(agent=agent)
             if imp:
                 return {"type": "system_improvement", "improvement": imp}
         return {"type": "none"}
@@ -183,13 +230,10 @@ def select_autonomous_task(allow_self_edit: bool = False, current_state_emb: lis
 
     if selected_goal:
         # 2. Goal Decomposition
-        # If it's a high-level goal and hasn't been decomposed, break it down.
-        # (We can treat anything with priority <= 5 as needing decomposition if complex,
-        # but let's just try to decompose any goal that doesn't have children yet)
         has_children = any(g.get("parent_id") ==
                            selected_goal["id"] for g in goals)
         if not has_children and not selected_goal.get("decomposed"):
-            sub_tasks = decompose_goal(selected_goal["goal_text"])
+            sub_tasks = decompose_goal(selected_goal["goal_text"], agent=agent)
             if sub_tasks and len(sub_tasks) > 1:
                 for st in sub_tasks:
                     st_emb = get_embedding(st)

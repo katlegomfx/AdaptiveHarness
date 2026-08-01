@@ -2,8 +2,7 @@
 import json
 import sqlite3
 from typing import Dict, List, Optional
-
-DB_PATH = "agent_state.db"
+from src.config import DB_PATH
 
 
 def init_db() -> None:
@@ -50,6 +49,24 @@ def init_db() -> None:
                 description TEXT,
                 status TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS progress_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                summary TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS aspect_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                aspect TEXT,
+                session_id TEXT,
+                content TEXT,
+                embedding TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.commit()
@@ -103,13 +120,12 @@ def retrieve_learnings(query: str, query_emb: list = None, limit: int = 5) -> li
             for r in rows:
                 text, emb_str = r[0], r[1]
                 emb = json.loads(emb_str) if emb_str else []
-                from llm_backend import cosine_similarity
+                from src.llm_backend import cosine_similarity
                 sim = cosine_similarity(query_emb, emb)
                 scored.append((sim, text))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [text for score, text in scored[:limit] if score > 0.1]
         else:
-            # Fallback to naive overlap
             query_tokens = set(query.lower().split())
             scored = []
             for r in rows:
@@ -120,6 +136,27 @@ def retrieve_learnings(query: str, query_emb: list = None, limit: int = 5) -> li
                     scored.append((overlap, text))
             scored.sort(key=lambda x: x[0], reverse=True)
             return [text for score, text in scored[:limit]]
+
+
+def save_summary(session_id: str, summary: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.cursor().execute(
+            "INSERT INTO progress_summaries (session_id, summary) VALUES (?, ?)",
+            (session_id, summary)
+        )
+        conn.commit()
+
+
+def retrieve_summaries(session_id: str, limit: int = 5) -> list[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT summary FROM progress_summaries WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (session_id, limit)
+        )
+        rows = cursor.fetchall()
+        # Return oldest to newest so it reads chronologically
+        return [row[0] for row in reversed(rows)]
 
 
 def add_long_term_goal(goal_text: str, priority: int = 5, source: str = "user", parent_id: int = None, embedding: list = None) -> int:
@@ -224,3 +261,39 @@ def log_system_improvement(file_path: str, description: str, status: str) -> Non
             "INSERT INTO system_improvements_log (file_path, description, status) VALUES (?, ?, ?)",
             (file_path, description, status))
         conn.commit()
+
+
+def save_aspect_memory(aspect: str, session_id: str, content: str, embedding: list = None):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.cursor().execute(
+            "INSERT INTO aspect_memory (aspect, session_id, content, embedding) VALUES (?, ?, ?, ?)",
+            (aspect, session_id, content, json.dumps(embedding or []))
+        )
+        conn.commit()
+
+
+def retrieve_aspect_memory(aspect: str, session_id: str, query_emb: list = None, limit: int = 3) -> list[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        # Get memories for this aspect in this session
+        cursor.execute(
+            "SELECT content, embedding FROM aspect_memory WHERE aspect = ? AND session_id = ? ORDER BY timestamp DESC LIMIT 10",
+            (aspect, session_id)
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            return []
+
+        if query_emb:
+            from src.llm_backend import cosine_similarity
+            scored = []
+            for r in rows:
+                text, emb_str = r[0], r[1]
+                emb = json.loads(emb_str) if emb_str else []
+                sim = cosine_similarity(query_emb, emb)
+                scored.append((sim, text))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [text for score, text in scored[:limit] if score > 0.1]
+        else:
+            return [r[0] for r in rows[:limit]]

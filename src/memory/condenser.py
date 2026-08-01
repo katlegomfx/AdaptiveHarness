@@ -1,16 +1,17 @@
 # memory.py
 import os
-from llm_backend import chat
+from src.llm_backend import chat
+from src.config import SUMMARY_TEMP
 
 
 def condense_history(
     messages: list,
     model_name: str = "ornith",
     max_window: int = 10,
-    token_threshold: int = 6000,
+    token_threshold: int = 128000,
     log_stream_func=None,
-) -> list:
-    """Summarizes older conversation turns while streaming visible output to stdout/log."""
+) -> tuple[list, str | None]:
+    """Summarizes older conversation turns. Returns (recent_history, summary_string)."""
     enc = None
     try:
         import tiktoken
@@ -26,24 +27,28 @@ def condense_history(
             return len(enc.encode(text))
         return len(text) // 4
 
-    total_tokens = sum(count_tokens(str(m.get("content", "")))
-                       for m in messages)
-    if total_tokens < token_threshold and len(messages) <= max_window * 2:
-        return messages
-
-    system_msg = messages[0] if messages[0].get("role") == "system" else None
+    system_msg = messages[0] if messages and messages[0].get(
+        "role") == "system" else None
     start_idx = 1 if system_msg else 0
 
     recent_messages = messages[-max_window:]
     older_messages = messages[start_idx:-max_window]
 
-    if not older_messages:
-        return messages
+    if not older_messages or len(older_messages) < 3:
+        return messages, None
+
+    total_tokens = sum(count_tokens(str(m.get("content", "")))
+                       for m in messages)
+    if total_tokens < token_threshold and len(messages) <= max_window * 2:
+        return messages, None
 
     summary_prompt = [
         {
             "role": "system",
-            "content": "Summarize the key facts, findings, decisions, and tool outputs from this conversation snippet concisely.",
+            "content": "Summarize the conversation snippet to preserve context for an AI agent. "
+                       "CRITICAL: You MUST retain exact file paths, exact error messages, code snippets, "
+                       "and specific variable names. Do not generalize technical details. "
+                       "List the actions taken, the outcomes, and any unresolved issues.",
         },
         {
             "role": "user",
@@ -60,12 +65,13 @@ def condense_history(
     think_enabled = os.environ.get(
         "THINK_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
     summary_content = ""
+
+    in_thinking = False
+    in_content = False
+
     try:
         stream = chat(model=model_name, messages=summary_prompt,
-                      think=think_enabled, stream=True)
-
-        in_thinking = False
-        in_content = False
+                      think=think_enabled, stream=True, temperature=SUMMARY_TEMP)
 
         for chunk in stream:
             msg = (
@@ -81,18 +87,20 @@ def condense_history(
             content = getattr(msg, "content", None) or (
                 msg.get("content") if isinstance(msg, dict) else None)
 
+            # Stream thinking to TUI/stdout
             if chunk_thinking:
                 if not in_thinking:
                     in_thinking = True
                     if log_stream_func:
-                        log_stream_func("\n[Thinking]\n")
+                        log_stream_func("\n[Memory Condenser Thinking]\n")
                     else:
-                        print("\n[Thinking]\n", end="")
+                        print("\n[Memory Condenser Thinking]\n", end="")
                 if log_stream_func:
                     log_stream_func(chunk_thinking)
                 else:
                     print(chunk_thinking, end="")
 
+            # Stream summary to TUI/stdout
             if content:
                 if in_thinking:
                     in_thinking = False
@@ -114,17 +122,16 @@ def condense_history(
         else:
             print(done_msg)
 
-        condensed_summary = {
-            "role": "system",
-            "content": f"[Progress Context Summary]: {summary_content.strip()}",
-        }
-
-        new_history = []
+        # Reconstruct recent history ensuring system_msg is at index 0
+        new_recent = []
         if system_msg:
-            new_history.append(system_msg)
-        new_history.append(condensed_summary)
-        new_history.extend(recent_messages)
-        return new_history
+            new_recent.append(system_msg)
+        for msg in recent_messages:
+            if system_msg and msg == system_msg:
+                continue
+            new_recent.append(msg)
+
+        return new_recent, summary_content.strip() or None
 
     except Exception as e:
         err_msg = f"\n-> [Memory Condenser Fallback] Summarization skipped: {e}\n"
@@ -132,4 +139,4 @@ def condense_history(
             log_stream_func(err_msg)
         else:
             print(err_msg)
-        return [system_msg] + recent_messages if system_msg else recent_messages
+        return messages, None

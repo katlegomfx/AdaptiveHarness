@@ -14,7 +14,7 @@ class AsyncInputReader:
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
-    def _read_loop(self) -> None:
+    def _read_loop(self) -> None:  # Define ONLY ONCE
         while not self._stop.is_set():
             try:
                 line = sys.stdin.readline()
@@ -25,21 +25,6 @@ class AsyncInputReader:
             if line == "":          # EOF
                 self._q.put(None)
                 self._eof = True
-                break
-            self._q.put(line.rstrip("\n"))
-
-    def is_eof(self) -> bool:
-        return self._eof
-
-    def _read_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                line = sys.stdin.readline()
-            except (OSError, ValueError):
-                self._q.put(None)
-                break
-            if line == "":          # EOF
-                self._q.put(None)
                 break
             self._q.put(line.rstrip("\n"))
 
@@ -49,6 +34,3 @@ class AsyncInputReader:
             return self._q.get(timeout=timeout)
         except queue.Empty:
             return None
-
-    def stop(self) -> None:
-        self._stop.set()

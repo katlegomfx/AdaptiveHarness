@@ -3,7 +3,8 @@ import os
 import subprocess
 import sys
 import tempfile
-from runtime.result import ToolResult, ResultStatus
+from src.core.result import ToolResult, ResultStatus
+from src.config import CUSTOM_TOOLS_DIR
 
 
 def execute_tool_in_sandbox(
@@ -14,7 +15,13 @@ def execute_tool_in_sandbox(
     work_dir: str = None,
 ) -> ToolResult:
     """Executes a dynamic tool in an isolated Python subprocess via STDIN IPC."""
-
+    custom_tool_path = os.path.join(CUSTOM_TOOLS_DIR, f"{tool_name}.py")
+    if not os.path.exists(custom_tool_path):
+        return ToolResult(
+            ResultStatus.NOT_FOUND,
+            f"Error: Custom tool '{tool_name}' has no source file at {custom_tool_path}. "
+            f"It may be a builtin tool that should not be sent to the sandbox."
+        )
     # Pass tool name safely via environment variable to prevent code injection
     runner_code = """
 import json, sys, io, os, traceback
@@ -86,13 +93,13 @@ except Exception as e:
     payload = json.dumps(args)
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
-    env["SANDBOX_TOOL_NAME"] = tool_name  # Safely pass the tool name
+    env["SANDBOX_TOOL_NAME"] = tool_name
 
-    cwd = os.getcwd()
+    # Update PYTHONPATH to include CUSTOM_TOOLS_DIR
     if "PYTHONPATH" in env:
-        env["PYTHONPATH"] = f"{cwd}{os.pathsep}{env['PYTHONPATH']}"
+        env["PYTHONPATH"] = f"{CUSTOM_TOOLS_DIR}{os.pathsep}{env['PYTHONPATH']}"
     else:
-        env["PYTHONPATH"] = cwd
+        env["PYTHONPATH"] = CUSTOM_TOOLS_DIR
 
     def _run_in_dir(target_dir: str) -> ToolResult:
         proc = subprocess.run(
@@ -143,7 +150,7 @@ except Exception as e:
             with tempfile.TemporaryDirectory() as temp_dir:
                 return _run_in_dir(temp_dir)
         else:
-            return _run_in_dir(cwd)
+            return _run_in_dir(os.getcwd())  # <-- FIX THIS
     except subprocess.TimeoutExpired:
         return ToolResult(ResultStatus.TIMEOUT, f"Error: Tool '{tool_name}' timed out after {timeout_seconds} seconds.")
     except Exception as e:

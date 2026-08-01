@@ -1,7 +1,5 @@
-# observability/logger.py
 import logging
 import json
-import sys
 
 
 class JsonFormatter(logging.Formatter):
