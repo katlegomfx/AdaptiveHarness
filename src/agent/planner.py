@@ -1,65 +1,55 @@
 # src/agent/planner.py
 import inspect
+import json
 from src.tools.registry import TOOL_REGISTRY, REGISTRY_LOCK
 from src.llm_backend import chat, get_embedding
-from src.config import META_PROMPT_MODEL
+from src.config import META_PROMPT_MODEL, META_PROMPT_TEMP
 from src.agent.context import build_aspect_context
 from src.memory.storage import save_aspect_memory
+from src.memory.reflection import _extract_json_from_text
 
 
-def generate_plan(agent, user_prompt: str) -> str:
-    agent.emit("-> [Pass 0] Synthesizing execution plan...")
+def generate_task_profile(agent, user_prompt: str, query_emb: list = None) -> tuple:
+    """Merges planning and directive generation into one LLM call."""
+    agent.emit("-> [Pass 0] Synthesizing Task Profile (Plan + Directives)...")
+
     with REGISTRY_LOCK:
         active_tools = list(TOOL_REGISTRY.values())
     tools_info = "\n".join(
         [f"- {t.__name__}: {inspect.getdoc(t) or 'No description'}" for t in active_tools])
 
     context_messages = build_aspect_context(
-        agent, "planner", user_prompt, recent_n=4)
+        agent, "planner", user_prompt, recent_n=4, query_emb=query_emb)
 
-    plan_messages = [
-        {"role": "system", "content": f"You are an expert planner. Create a concise step-by-step plan. Identify what tools need to be used. CRITICAL: DO NOT execute tools, write code, or answer the user's prompt. Just list the steps.\n\nAvailable tools:\n{tools_info}"},
-        *context_messages,  # Inject the recent conversation here!
+    messages = [
+        {"role": "system",
+            "content": f"You are an expert planner. Output a JSON object with 'plan' (step-by-step string) and 'directives' (3-5 concise rules string). Do not execute tools, write code, or answer the user's prompt.\n\nAvailable tools:\n{tools_info}"},
+        *context_messages,
         {"role": "user", "content": user_prompt}
     ]
+
     try:
-        stream = chat(model=META_PROMPT_MODEL,
-                      messages=plan_messages, stream=True)
-        plan = agent._print_stream_and_get_content(
-            stream, header="[Plan]\n", end="\n\n")
-        if plan:
-            save_aspect_memory("planner", agent.session_id,
-                               plan, embedding=get_embedding(plan))
-        return plan, tools_info
-    except Exception as e:
-        agent.emit(f"   [Planning Failed]: {e}\n")
-        return "", tools_info
+        stream = chat(model=META_PROMPT_MODEL, messages=messages,
+                      stream=True, temperature=META_PROMPT_TEMP)
+        buf = agent._print_stream_and_get_content(
+            stream, header="[Task Profile]\n", end="\n\n")
 
+        data = _extract_json_from_text(buf)
+        if data:
+            plan = data.get("plan", "")
+            directives = data.get("directives", "")
+            if plan:
+                plan_emb = get_embedding(
+                    plan) if query_emb is None else query_emb
+                save_aspect_memory("planner", agent.session_id,
+                                   plan, embedding=plan_emb)
+            return plan, directives, tools_info
 
-def generate_dynamic_system_prompt(agent, goal: str, plan: str, tools_info: str) -> str:
-    agent.emit("-> [Pass 1] Synthesizing task-specific System Prompt...")
-
-    # Get recent context
-    context_messages = build_aspect_context(
-        agent, "meta_prompter", goal, recent_n=2)
-
-    meta_messages = [
-        {"role": "system", "content": "You are a tactical directive generator for an AI agent. Output 3-5 concise rules."},
-        *context_messages,  # Inject context here!
-        {"role": "user", "content": f"Goal: {goal}\n\nExecution Plan:\n{plan}\n\nCRITICAL INSTRUCTIONS:\n- DO NOT answer the goal yourself.\n- DO NOT guess file contents or hallucinate data.\n- ONLY output 3-5 tactical directives for the main agent to follow."}
-    ]
-    # ... rest of the function remains the same
-    try:
-        stream = chat(model=META_PROMPT_MODEL,
-                      messages=meta_messages, stream=True)
-        dynamic_rules = agent._print_stream_and_get_content(
-            stream, header="[Meta-Prompt Directives]\n", end="\n\n-> [Pass 1 Complete] Dynamic instructions generated.\n\n")
-        if dynamic_rules:
-            save_aspect_memory("meta_prompter", agent.session_id,
-                               dynamic_rules, embedding=get_embedding(dynamic_rules))
-
-        return dynamic_rules.strip()
-    except Exception as e:
+        # Fallback if JSON parsing fails
         agent.emit(
-            f"\n-> [Pass 1 Fallback] Meta-prompt generation skipped: {e}\n\n")
-        return "Focus on safe, correct code execution and modular tool design."
+            "   [Task Profile Fallback]: Failed to parse JSON. Using raw text as plan.\n")
+        return buf, "Focus on safe, correct code execution and modular tool design.", tools_info
+
+    except Exception as e:
+        agent.emit(f"   [Task Profile Failed]: {e}\n")
+        return "", "Focus on safe, correct code execution and modular tool design.", tools_info

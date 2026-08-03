@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 from src.core.result import ToolResult, ResultStatus
-from src.config import CUSTOM_TOOLS_DIR
+from src.config import CUSTOM_TOOLS_DIR, DATA_DIR
 
 
 def execute_tool_in_sandbox(
@@ -95,11 +95,10 @@ except Exception as e:
     env["PYTHONUTF8"] = "1"
     env["SANDBOX_TOOL_NAME"] = tool_name
 
-    # Update PYTHONPATH to include CUSTOM_TOOLS_DIR
+    path_parts = [DATA_DIR]
     if "PYTHONPATH" in env:
-        env["PYTHONPATH"] = f"{CUSTOM_TOOLS_DIR}{os.pathsep}{env['PYTHONPATH']}"
-    else:
-        env["PYTHONPATH"] = CUSTOM_TOOLS_DIR
+        path_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(path_parts)
 
     def _run_in_dir(target_dir: str) -> ToolResult:
         proc = subprocess.run(

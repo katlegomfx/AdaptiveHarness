@@ -3,7 +3,7 @@ from src.llm_backend import get_embedding
 from src.memory.storage import retrieve_learnings, retrieve_aspect_memory
 
 
-def build_aspect_context(agent, aspect: str, query: str, recent_n=4):
+def build_aspect_context(agent, aspect: str, query: str, recent_n=4, query_emb: list = None):
     """
     Builds a tailored context list for a specific sub-agent (aspect).
     Retrieves: Recent chat + Global learnings + Aspect's own past memories.
@@ -16,7 +16,9 @@ def build_aspect_context(agent, aspect: str, query: str, recent_n=4):
     context.extend(agent.history[start_idx:][-recent_n:])
 
     # 2. Get aspect-specific past memories (e.g., past plans, past test cases)
-    query_emb = get_embedding(query)
+    if query_emb is None:
+        query_emb = get_embedding(query)
+
     aspect_mems = retrieve_aspect_memory(
         aspect, agent.session_id, query_emb=query_emb, limit=2)
     if aspect_mems:

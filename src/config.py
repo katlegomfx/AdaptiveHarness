@@ -22,7 +22,6 @@ LLMS_DIR = os.path.join(BASE_DIR, "llms")
 for d in (DATA_DIR, LOG_DIR, CUSTOM_TOOLS_DIR, BACKUP_DIR, PATCH_DIR, LLMS_DIR):
     os.makedirs(d, exist_ok=True)
 
-# KEY FIX: Add DATA_DIR to sys.path so `import custom_tools` works in sandbox
 if DATA_DIR not in sys.path:
     sys.path.insert(0, DATA_DIR)
 

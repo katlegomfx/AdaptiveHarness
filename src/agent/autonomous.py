@@ -94,7 +94,7 @@ def decompose_goal(goal_text: str, agent=None) -> List[str]:
             "content": (
                 "You are a task decomposition agent. Break down the provided large goal into 2-4 smaller, "
                 "actionable sub-tasks that can be executed sequentially. "
-                "Return ONLY a raw JSON array of strings."
+                "Return ONLY a raw JSON array of strings. Do not output <think> tags or markdown."
             ),
         },
         {"role": "user", "content": f"Large Goal: {goal_text}"},
@@ -119,6 +119,14 @@ def decompose_goal(goal_text: str, agent=None) -> List[str]:
                     buf += c
 
         cleaned = buf.strip().replace("```json", "").replace("```", "").strip()
+
+        start = cleaned.find('[')
+        end = cleaned.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start:end+1]
+        else:
+            return []  # No array found
+
         sub_tasks = json.loads(cleaned)
         if isinstance(sub_tasks, list) and sub_tasks:
             return [s.strip() for s in sub_tasks if isinstance(s, str) and s.strip()]
@@ -128,7 +136,6 @@ def decompose_goal(goal_text: str, agent=None) -> List[str]:
         else:
             logger.warning(f"Goal decomposition failed: {e}")
     return []
-
 
 def find_system_improvement_opportunity(agent=None) -> Optional[Dict]:
     file_contents: Dict[str, str] = {}

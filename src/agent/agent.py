@@ -1,13 +1,13 @@
 from src.config import (
     LOG_FILE_PATH, JSON_LOG_PATH, PATCH_DIR,
     REASONING_MODEL, META_PROMPT_MODEL, TESTER_MODEL, SUMMARY_MODEL, THINK_ENABLED, CUSTOM_TOOLS_DIR, IMPROVEMENT_GUIDE_PATH,
-    REASONING_TEMP, META_PROMPT_TEMP, TESTER_TEMP  # <--- ADD THIS
+    REASONING_TEMP, META_PROMPT_TEMP, TESTER_TEMP
 )
 from src.agent.context import build_aspect_context
 from src.memory.storage import save_aspect_memory
 from src.agent.prompts import BASE_SYSTEM_PROMPT
 from src.memory.reflection import reflect_on_task, _extract_json_from_text
-from src.agent.planner import generate_plan, generate_dynamic_system_prompt
+from src.agent.planner import generate_task_profile
 from src.core.metrics import metrics
 from src.core.logger import logger, JsonFormatter
 from src.core.result import ToolResult, ResultStatus
@@ -133,6 +133,13 @@ class Agent:
 
                 # State machine to filter out <think> tags from the TUI stream
                 while text_buffer:
+                    if len(text_buffer) > 200:
+                        # Check if the last 50 characters appear 3 times
+                        snippet = text_buffer[-50:]
+                        if text_buffer.count(snippet) >= 3:
+                            self.emit(
+                                "\n[Safety] Repetition loop detected. Aborting generation.\n")
+                            return content  # Abort early
                     if suppress_output:
                         end_idx = text_buffer.find("</think>")
                         if end_idx != -1:
@@ -410,7 +417,6 @@ class Agent:
         start_time = time.time()
         status = ResultStatus.SUCCESS
         try:
-            # --- KEY FIX: Builtin tools execute IN-PROCESS ---
             if is_builtin_tool(resolved_name):
                 self.emit(
                     f"-> [In-Process Execution] Tool: '{resolved_name}' [Trace: {trace_id}]...\n")
@@ -429,7 +435,6 @@ class Agent:
                     status = ResultStatus.VALIDATION_FAILURE
                 return ToolResult(status, result_str)
 
-            # --- Custom tools still go through sandbox ---
             else:
                 self.emit(
                     f"-> [Sandbox Execution] Tool: '{resolved_name}' [Trace: {trace_id}]...\n")
@@ -453,14 +458,11 @@ class Agent:
             resolved_name, _ = self.resolve_tool_function(
                 self._get_call_details(current_call)[0])
 
-            # --- KEY FIX: Don't try to heal builtin tools ---
             is_dynamic_tool = (resolved_name not in META_TOOLS
                                and not is_builtin_tool(resolved_name))
 
             if not is_dynamic_tool or result.is_success or result.status == ResultStatus.NOT_FOUND or heal_attempts >= max_heals:
                 return resolved_name, result
-
-            # ... rest of self-heal logic for custom tools only ...
 
             heal_attempts += 1
             self.emit(
@@ -475,7 +477,6 @@ class Agent:
             except Exception:
                 return resolved_name, result
 
-            # Inside execute_single_tool_call, right before calling the LLM to heal:
             raw_func_name, args = self._get_call_details(current_call)
 
             heal_messages = [
@@ -518,13 +519,13 @@ class Agent:
                 result.value += f"\n\n[Self-Heal Attempt Failed]: {heal_result.value}"
                 return resolved_name, result
 
-    def run_agent_loop(self, user_prompt: str, plan: str, tools_info: str, learnings: list = None) -> None:
+    def run_agent_loop(self, user_prompt: str, plan: str, directives: str, tools_info: str, learnings: list = None, query_emb: list = None) -> None:
         self.emit(
             f"\n=== User Turn: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
         self.emit(f"User > {user_prompt}\n\n")
 
-        dynamic_instructions = generate_dynamic_system_prompt(
-            self, user_prompt, plan, tools_info)
+        dynamic_instructions = directives
+        
         plan_str = f"\n\nExecution Plan:\n{plan}" if plan else ""
 
         learnings_str = ""
@@ -581,7 +582,6 @@ class Agent:
             assistant_message = self.ask_model_stream(
                 self.history, active_tools)
 
-            # --- KEY FIX: Robust Fallback Parser for local models ---
             if not assistant_message.tool_calls and assistant_message.content:
                 content = assistant_message.content
                 # Strip <think> tags if the model outputted them as text
@@ -832,11 +832,12 @@ class Agent:
 
             prompt = f"[Autonomous Task — Long-Term Goal #{gid}]\n{gtext}"
             try:
-                plan, tools_info = generate_plan(
-                    agent=self, user_prompt=prompt)
-                learnings = retrieve_learnings(
-                    gtext, query_emb=get_embedding(gtext))
-                self.run_agent_loop(prompt, plan, tools_info, learnings)
+                query_emb = get_embedding(gtext)
+                plan, directives, tools_info = generate_task_profile(
+                    agent=self, user_prompt=prompt, query_emb=query_emb)
+                learnings = retrieve_learnings(gtext, query_emb=query_emb)
+                self.run_agent_loop(prompt, plan, directives,
+                                    tools_info, learnings, query_emb=query_emb)
                 reflect_on_task(self, prompt, self.history, plan)
 
                 if self._is_goal_satisfied(gtext):
@@ -872,9 +873,13 @@ class Agent:
                 f"region back to confirm the change is correct."
             )
             try:
-                plan, tools_info = generate_plan(agent=self, user_prompt=prompt)
+                query_emb = get_embedding(f"improve {fpath}")
+                plan, directives, tools_info = generate_task_profile(
+                    agent=self, user_prompt=prompt, query_emb=query_emb)
                 learnings = retrieve_learnings(
-                    f"improve {fpath}", query_emb=get_embedding(f"improve {fpath}"))
+                    f"improve {fpath}", query_emb=query_emb)
+                self.run_agent_loop(prompt, plan, directives,
+                                    tools_info, learnings, query_emb=query_emb)
                 self.run_agent_loop(prompt, plan, tools_info, learnings)
                 reflect_on_task(self, prompt, self.history, plan)
                 log_system_improvement(fpath, issue, "applied")

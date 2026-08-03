@@ -8,7 +8,7 @@ def condense_history(
     messages: list,
     model_name: str = "ornith",
     max_window: int = 10,
-    token_threshold: int = 128000,
+    token_threshold: int = 64000,
     log_stream_func=None,
 ) -> tuple[list, str | None]:
     """Summarizes older conversation turns. Returns (recent_history, summary_string)."""

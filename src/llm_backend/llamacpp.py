@@ -51,7 +51,8 @@ def _chat_llamacpp(model, messages, tools, think, stream, temperature):
     openai_tools = _tools_to_openai(tools)
     # Use the passed temperature instead of hardcoded 0.5
     kwargs: Dict[str, Any] = {"messages": messages,
-                              "stream": True, "temperature": temperature, "top_p": 0.2}
+                              "stream": True, "temperature": temperature, "top_p": 0.2,
+                              "repeat_penalty": 1.15}
     if openai_tools:
         kwargs["tools"] = openai_tools
         kwargs["tool_choice"] = "auto"
