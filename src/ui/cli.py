@@ -17,7 +17,7 @@ from src.memory.reflection import reflect_on_task
 from src.memory.storage import add_long_term_goal, mark_goal_completed, retrieve_learnings, list_long_term_goals
 from src.llm_backend import get_embedding
 from src.config import PATCH_DIR, AUTONOMOUS_COOLDOWN_SECONDS, MAX_AUTONOMOUS_CYCLES_IN_A_ROW
-from src.ui.commands import handle_special_commands  # <-- IMPORT FROM NEW FILE
+from src.ui.commands import handle_special_commands
 
 # Initialize Rich Console
 console = Console()
@@ -25,7 +25,10 @@ console = Console()
 
 def rich_stream_handler(text: str):
     """Parses agent output and formats it with Rich."""
+    # If it's just whitespace/newlines, print it raw to maintain spacing
     if not text.strip():
+        if "\n" in text:
+            console.print(text, end="")
         return
 
     # 1. Tool Results -> Blue Panel
@@ -50,13 +53,12 @@ def rich_stream_handler(text: str):
     # 7. Special Command Outputs -> White/Bold
     elif text.startswith("===") or text.startswith("   [") or text.startswith("  -") or text.startswith("   Usage"):
         console.print(text, style="bold white", end="")
-    # 8. Final Response (No tags, just raw text from LLM) -> Markdown
-    elif not text.startswith("->") and not text.startswith("   ") and not text.startswith("==="):
-        # Render as Markdown (Rich handles syntax highlighting for code blocks automatically)
-        console.print(Markdown(text))
+    # 8. Final Response (No tags, just raw text from LLM) -> Plain White
     else:
-        # Default dim text for turn markers, etc.
-        console.print(text, style="dim", end="")
+        # FIX: Do not use Markdown() on streaming chunks.
+        # It treats each chunk as a separate block and breaks them onto new lines.
+        # Just print the text directly to maintain a smooth stream.
+        console.print(text, style="white", end="")
 
 
 def run_blocking_loop(agent, use_tui: bool = False) -> None:
